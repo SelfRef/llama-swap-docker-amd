@@ -1,0 +1,24 @@
+services:
+  llama-swap:
+    build: .
+    # `docker compose pull` fetches the CI-built image; `docker compose build` rebuilds locally
+    image: ghcr.io/selfref/llama-swap-docker-amd:latest
+    ports:
+      - "8080:8080"
+    devices:
+      - /dev/kfd   # ROCm compute (omit if the GPU is Vulkan-only)
+      - /dev/dri   # GPU render nodes (needed by both ROCm and Vulkan)
+    # The container runs as root, so no group_add is needed for device access.
+    # If you switch to a non-root user, add the *numeric* host GIDs of the
+    # video/render groups here (the image has no "render" group to resolve by name).
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - ./models:/models
+      # config.yaml lives here; -watch-config reloads it on change
+      - ./config:/etc/llama-swap/config
+    # environment:
+    #   HSA_OVERRIDE_GFX_VERSION: "11.0.0"  # ROCm on unsupported consumer GPUs -- see README
+    #   HIP_VISIBLE_DEVICES: "0"            # GPU selection for the *-rocm binaries
+    #   GGML_VK_VISIBLE_DEVICES: "0"        # GPU selection for the Vulkan binaries
+    restart: unless-stopped

@@ -1,0 +1,62 @@
+# Example llama-swap configuration for the AMD (ROCm + Vulkan) image.
+#
+# Every engine is present in two builds:
+#   ROCm (HIP):  llama-server-rocm, whisper-server-rocm, sd-server-rocm, ...
+#   Vulkan:      llama-server, whisper-server, sd-server, ...
+# Pick per model whichever backend suits your GPU. audio.cpp (audiocpp_server)
+# is Vulkan-only. Full config reference:
+# https://github.com/mostlygeek/llama-swap/wiki/Configuration
+
+healthCheckTimeout: 300
+logRequests: true
+
+models:
+  # llama.cpp on ROCm -- fastest on GPUs with ROCm support
+  "qwen3-4b":
+    cmd: >
+      llama-server-rocm
+      -hf unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M
+      --port ${PORT}
+      -ngl 999
+
+  # Same model on Vulkan -- for GPUs ROCm doesn't cover (or when it misbehaves)
+  "qwen3-4b-vulkan":
+    cmd: >
+      llama-server
+      -hf unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M
+      --port ${PORT}
+      -ngl 999
+
+  "whisper":
+    checkEndpoint: /v1/audio/transcriptions/
+    cmd: >
+      whisper-server-rocm
+      --port ${PORT}
+      -m /models/whisper.bin
+      --flash-attn
+      --request-path /v1/audio/transcriptions --inference-path ""
+
+  "image":
+    checkEndpoint: /
+    cmd: |
+      sd-server-rocm
+      --listen-port ${PORT}
+      --diffusion-fa
+      --diffusion-model /models/z_image_turbo-Q8_0.gguf
+      --vae /models/ae.safetensors
+      --llm /models/qwen3-4b-instruct-2507-q8_0.gguf
+      --offload-to-cpu
+      --cfg-scale 1.0
+      --height 512 --width 512
+      --steps 8
+
+  # audio.cpp for TTS -- Vulkan build only (no HIP backend upstream).
+  # Needs its own JSON config; copy the starter shipped in the image:
+  #   docker run --rm --entrypoint cat <image> \
+  #     /etc/llama-swap/audiocpp-server.example.json > ./models/audiocpp-server.json
+  "audio":
+    checkEndpoint: /health
+    cmd: |
+      audiocpp_server
+      --config /models/audiocpp-server.json
+      --port ${PORT}
