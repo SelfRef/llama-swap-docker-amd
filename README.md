@@ -47,17 +47,17 @@ Build args:
 |---|---|---|
 | `BASE_IMAGE` | `ghcr.io/mostlygeek/llama-swap:unified-vulkan` | Base image (must be the root variant, not `-rootless`). Pin a dated tag or digest for reproducibility. |
 | `ROCM_VERSION` | `7.2.4` | ROCm version for both the builder image and the runtime apt packages |
-| `AMDGPU_TARGETS` | `gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201` | gfx architectures compiled into the HIP binaries. Trim to just your GPU for a much faster build. |
+| `AMDGPU_TARGETS` | `gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201` | gfx architectures compiled into the HIP binaries (RDNA2/3/3.5/4). CDNA (`gfx908;gfx90a;gfx942`) is not included by default — add it if you run Instinct cards. Trim to just your GPU for a much faster build. |
 | `LLAMA_COMMIT` | `master` | llama.cpp revision for both the Vulkan and the ROCm build (sha, tag, branch, or `refs/pull/N/head`). `""` = the base image's commit from `/versions.txt`. Defaults to master so the PRs in `LLAMA_PATCHES` apply and the newest backend work is in. |
 | `WHISPER_COMMIT` / `SD_COMMIT` | *(empty)* | Override the project revision; empty means "same commit as the base image" |
 | `GLSLC_SUITE` | `resolute` | Ubuntu release whose `glslc`/`libshaderc1` are used by the Vulkan builder (only those two packages; everything else stays 24.04) |
 | `LLAMA_FA_ALL_QUANTS` | `ON` | ROCm llama.cpp: compile flash-attention kernels for all K/V cache quant combinations (without it only q8_0/q8_0 and q4_0/q4_0 stay on the GPU, see llama.cpp #27761). Set `OFF` for a faster build. |
 | `MESA_PPA` | `ppa:kisak/kisak-mesa` | Newer Mesa/RADV for the final image; `""` keeps the base image's stock Mesa 25.2 |
-| `LLAMA_PATCHES` | `27952` | Space-separated upstream llama.cpp PR numbers applied on top of `LLAMA_COMMIT` (both backends). A patch that no longer applies is skipped if the PR is merged, otherwise the build fails — never a silent no-op. See [Trying upstream PRs](#trying-upstream-prs). |
+| `LLAMA_PATCHES` | `27952` | Space-separated upstream llama.cpp PR numbers merged on top of `LLAMA_COMMIT` (both backends), fetched over git as `refs/pull/N/head`. A PR that is closed on GitHub is skipped with a notice; one that no longer merges cleanly fails the build — never a silent no-op. See [Trying upstream PRs](#trying-upstream-prs). |
 
 ## Trying upstream PRs
 
-`LLAMA_PATCHES="27952 26284"` fetches `github.com/ggml-org/llama.cpp/pull/<N>.patch` for each number and applies it to `LLAMA_COMMIT` before building (Vulkan and ROCm alike). If a patch no longer applies, the build asks GitHub whether the PR was merged: merged → skipped with a notice (drop it from the list), otherwise → build error (the PR moved; re-check it). Applied patches and the built llama.cpp commit are listed in `/versions.txt`.
+`LLAMA_PATCHES="27952 26284"` fetches each PR's branch over git (`refs/pull/<N>/head`, blobless) and merges it into `LLAMA_COMMIT` before building (Vulkan and ROCm alike). The `.patch` HTTP endpoint is deliberately not used — GitHub rate-limits it (HTTP 429) from shared CI runner IPs. GitHub keeps `refs/pull/<N>/merge` only while a PR is open, so a closed PR (merged or rejected) is detected and skipped with a notice — drop it from the list; a PR that no longer merges cleanly fails the build (it drifted; re-check it). Merged PRs and the built llama.cpp commit are listed in `/versions.txt`.
 
 Measured on an RX 7900 XTX with this image (Mesa 26.1, llama-bench, q8_0/q4_0 KV, ub 512; dense = Qwen3.8-27B UD-Q4_K_XL, MoE = Qwen3.6-35B-A3B UD-Q4_K_M):
 
@@ -88,7 +88,7 @@ Edit [config/config.yaml](config/config.yaml) to define your models — it shows
 
 | GPU | Recommendation |
 |---|---|
-| Instinct MI100–MI350 (gfx908/90a/942) | ROCm |
+| Instinct MI100–MI350 (gfx908/90a/942) | ROCm — add the targets to `AMDGPU_TARGETS` and build yourself (not in the published image) |
 | RDNA3/3.5/4 — RX 7000/9000, Ryzen AI APUs (gfx11xx/12xx) | ROCm; Vulkan as fallback |
 | RDNA2 — RX 6000 (gfx1030 covered, rest via override) | either; Vulkan often less fuss |
 | RDNA1, Vega, older iGPUs | Vulkan |
@@ -126,7 +126,7 @@ docker run --rm --entrypoint cat ghcr.io/selfref/llama-swap-docker-amd:latest /v
 
 ## Notes
 
-- The image is large (~15–20 GB): the ROCm runtime with rocBLAS/hipBLASLt kernel libraries for 11 architectures accounts for most of it.
+- The image is large (~13–15 GB): the ROCm runtime with rocBLAS/hipBLASLt kernel libraries accounts for most of it.
 - The Vulkan engines are NOT the base image's binaries (see above); `audiocpp_server`, `llama-swap` and `vllm-wrapper` are. The base image's shared `libggml*.so`/`libwhisper*.so` in `/usr/local/lib` are removed (nothing uses them any more).
 - The container runs as root (standard for ROCm images — device access works without any `--group-add`). Files created in `/models` will be root-owned on the host. If you run as a non-root user, pass the *numeric* host GIDs of your `video`/`render` groups (`--group-add $(getent group render | cut -d: -f3)`); the image has no `render` group, so adding it by name fails.
 - Verified on a Ryzen AI MAX+ 395 / Radeon 8060S (Strix Halo, gfx1151): both `llama-server --list-devices` (Vulkan/RADV) and `llama-server-rocm --list-devices` (ROCm) see the GPU. A gfx1100-only build also works on it with `HSA_OVERRIDE_GFX_VERSION=11.0.0`.

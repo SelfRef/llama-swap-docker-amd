@@ -65,11 +65,14 @@ ARG BASE_IMAGE=ghcr.io/mostlygeek/llama-swap:unified-vulkan
 
 ARG ROCM_VERSION=7.2.4
 
-# Fat build covering everything rocBLAS ships Tensile kernels for -- same list
-# as llama.cpp's official ROCm image: CDNA1-3 (gfx908/90a/942), RDNA2 (gfx1030),
-# RDNA3/3.5 (gfx1100/01/02, gfx1150/51), RDNA4 (gfx1200/01). GPUs not listed
-# here can still use the Vulkan binaries.
-ARG AMDGPU_TARGETS="gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
+# gfx architectures compiled into the HIP binaries: RDNA2 (gfx1030), RDNA3/3.5
+# (gfx1100/01/02, gfx1150/51), RDNA4 (gfx1200/01) -- the consumer/APU cards this
+# image is for. The CDNA data-center targets of llama.cpp's official ROCm image
+# (gfx908;gfx90a;gfx942) are left out: they cost ~30% of an already long CI
+# build (all-quant FA kernels x every target) and Instinct users have AMD's own
+# containers; add them back here if needed. GPUs not listed can still use the
+# Vulkan binaries.
+ARG AMDGPU_TARGETS="gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
 
 # Ubuntu release whose glslc/libshaderc1 are installed into the (24.04) Vulkan
 # builder. Only those two packages come from it (per-package release selection
@@ -90,10 +93,10 @@ ARG LLAMA_FA_ALL_QUANTS=ON
 ARG LLAMA_COMMIT="master"
 
 # Upstream llama.cpp pull requests to apply on top of LLAMA_COMMIT, as a
-# space-separated list of PR numbers (fetched from github.com/.../pull/N.patch).
-# A patch that no longer applies is skipped if GitHub says the PR is merged
-# (the tree already has it) and FAILS the build otherwise, so drift is never a
-# silent no-op. Default: #27952 "vulkan: int8 coopmat1 matmul for AMD RDNA3/4"
+# space-separated list of PR numbers (fetched over git as refs/pull/N/head
+# and merged; the .patch endpoint is rate-limited on CI runners). A PR that is
+# closed on GitHub (merged or rejected) is skipped with a notice; one that no
+# longer merges cleanly FAILS the build, so drift is never a silent no-op. Default: #27952 "vulkan: int8 coopmat1 matmul for AMD RDNA3/4"
 # (0cc4m) -- measured on an RX 7900 XTX: pp512 +4.6% dense (Q4_K_XL),
 # +18.5% MoE (Qwen3.6-35B-A3B Q4_K_M), decode unchanged. Remove it once merged
 # (the build tells you). Also measured and NOT adopted: #25483 (MoE coopmat
@@ -167,25 +170,32 @@ echo "=== Cloning llama.cpp at ${COMMIT} ==="
 mkdir -p /src/llama.cpp && cd /src/llama.cpp
 git init -q
 git remote add origin https://github.com/ggml-org/llama.cpp.git
-git fetch --depth=1 origin "${COMMIT}"
+# Blobless (not shallow) fetch: full history so PR branches can be merged
+# properly below; file contents are fetched lazily on checkout.
+git fetch --filter=blob:none origin "${COMMIT}"
 git checkout -q FETCH_HEAD
+echo "llama.cpp at $(git rev-parse HEAD)"
 
+# PRs are pulled over git (refs/pull/N/head) and MERGED, never via the
+# github.com/.../pull/N.patch endpoint -- that one is rate-limited (HTTP 429)
+# from shared CI runner IPs and made builds fail. GitHub keeps refs/pull/N/merge
+# only while a PR is open, so a missing merge ref means the PR was closed
+# (merged or rejected): skip it and say so. A conflicting merge is a real
+# drift and fails the build.
 for pr in ${LLAMA_PATCHES:-}; do
-    echo "=== Applying upstream PR #${pr} ==="
-    curl -fsSL --retry 8 --retry-delay 20 --retry-all-errors -o "/tmp/pr${pr}.patch" "https://github.com/ggml-org/llama.cpp/pull/${pr}.patch"
-    if git apply --check "/tmp/pr${pr}.patch" 2>/tmp/pr${pr}.err; then
-        git apply "/tmp/pr${pr}.patch"
-    else
-        # Already merged upstream (so the tree has it and the patch no longer
-        # applies)? Then skip quietly; anything else is a real drift -> fail.
-        merged=$(curl -fsSL --retry 5 --retry-delay 20 --retry-all-errors "https://api.github.com/repos/ggml-org/llama.cpp/pulls/${pr}"                  | grep -o '"merged": *[a-z]*' | head -1 | grep -o 'true\|false' || echo unknown)
-        if [ "$merged" = "true" ]; then
-            echo "PR #${pr} is already merged upstream -- skipping (remove it from LLAMA_PATCHES)"
-        else
-            echo "FATAL: PR #${pr} does not apply to ${COMMIT} (merged=${merged}):" >&2
-            cat /tmp/pr${pr}.err >&2; exit 1
-        fi
+    echo "=== Merging upstream PR #${pr} ==="
+    if ! git ls-remote --exit-code origin "refs/pull/${pr}/merge" >/dev/null 2>&1; then
+        echo "PR #${pr} is closed on GitHub (merged or rejected) -- skipping; remove it from LLAMA_PATCHES"
+        continue
     fi
+    git fetch --filter=blob:none origin "refs/pull/${pr}/head"
+    if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+        echo "PR #${pr} is already contained in ${COMMIT} -- skipping"
+        continue
+    fi
+    git -c user.name=llama-swap-amd -c user.email=build@localhost \
+        merge --no-edit --no-ff -m "merge upstream PR #${pr}" FETCH_HEAD \
+        || { echo "FATAL: PR #${pr} does not merge cleanly into ${COMMIT} -- it has drifted, re-check it" >&2; exit 1; }
 done
 
 echo "=== glslc feature tests (llama.cpp's own) ==="
@@ -377,25 +387,32 @@ echo "=== Cloning llama.cpp at ${COMMIT} ==="
 mkdir -p /src/llama.cpp && cd /src/llama.cpp
 git init -q
 git remote add origin https://github.com/ggml-org/llama.cpp.git
-git fetch --depth=1 origin "${COMMIT}"
+# Blobless (not shallow) fetch: full history so PR branches can be merged
+# properly below; file contents are fetched lazily on checkout.
+git fetch --filter=blob:none origin "${COMMIT}"
 git checkout -q FETCH_HEAD
+echo "llama.cpp at $(git rev-parse HEAD)"
 
+# PRs are pulled over git (refs/pull/N/head) and MERGED, never via the
+# github.com/.../pull/N.patch endpoint -- that one is rate-limited (HTTP 429)
+# from shared CI runner IPs and made builds fail. GitHub keeps refs/pull/N/merge
+# only while a PR is open, so a missing merge ref means the PR was closed
+# (merged or rejected): skip it and say so. A conflicting merge is a real
+# drift and fails the build.
 for pr in ${LLAMA_PATCHES:-}; do
-    echo "=== Applying upstream PR #${pr} ==="
-    curl -fsSL --retry 8 --retry-delay 20 --retry-all-errors -o "/tmp/pr${pr}.patch" "https://github.com/ggml-org/llama.cpp/pull/${pr}.patch"
-    if git apply --check "/tmp/pr${pr}.patch" 2>/tmp/pr${pr}.err; then
-        git apply "/tmp/pr${pr}.patch"
-    else
-        # Already merged upstream (so the tree has it and the patch no longer
-        # applies)? Then skip quietly; anything else is a real drift -> fail.
-        merged=$(curl -fsSL --retry 5 --retry-delay 20 --retry-all-errors "https://api.github.com/repos/ggml-org/llama.cpp/pulls/${pr}"                  | grep -o '"merged": *[a-z]*' | head -1 | grep -o 'true\|false' || echo unknown)
-        if [ "$merged" = "true" ]; then
-            echo "PR #${pr} is already merged upstream -- skipping (remove it from LLAMA_PATCHES)"
-        else
-            echo "FATAL: PR #${pr} does not apply to ${COMMIT} (merged=${merged}):" >&2
-            cat /tmp/pr${pr}.err >&2; exit 1
-        fi
+    echo "=== Merging upstream PR #${pr} ==="
+    if ! git ls-remote --exit-code origin "refs/pull/${pr}/merge" >/dev/null 2>&1; then
+        echo "PR #${pr} is closed on GitHub (merged or rejected) -- skipping; remove it from LLAMA_PATCHES"
+        continue
     fi
+    git fetch --filter=blob:none origin "refs/pull/${pr}/head"
+    if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+        echo "PR #${pr} is already contained in ${COMMIT} -- skipping"
+        continue
+    fi
+    git -c user.name=llama-swap-amd -c user.email=build@localhost \
+        merge --no-edit --no-ff -m "merge upstream PR #${pr}" FETCH_HEAD \
+        || { echo "FATAL: PR #${pr} does not merge cleanly into ${COMMIT} -- it has drifted, re-check it" >&2; exit 1; }
 done
 
 echo "=== Building llama.cpp (HIP) for ${AMDGPU_TARGETS}, FA_ALL_QUANTS=${LLAMA_FA_ALL_QUANTS} ==="
