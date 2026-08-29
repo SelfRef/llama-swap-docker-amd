@@ -14,23 +14,33 @@ on:
       - config/**
       - .github/workflows/build.yml
   schedule:
-    # Weekly rebuild to pick up the current unified-vulkan base image and the
-    # matching llama.cpp / whisper.cpp / stable-diffusion.cpp revisions
+    # Weekly rebuild to pick up the current unified-vulkan base image, current
+    # llama.cpp master and the matching whisper.cpp / stable-diffusion.cpp revisions
     - cron: "0 4 * * 1"
   workflow_dispatch:
     inputs:
+      rocm:
+        description: "Also build the ROCm stages and publish the full image as :rocm (hours of runner time)"
+        type: boolean
+        required: false
+        default: false
       llama_commit:
         description: "llama.cpp revision (sha/tag/branch/refs/pull/N/head); empty = Dockerfile default (master)"
         required: false
         default: ""
       llama_patches:
-        description: "upstream llama.cpp PR numbers to apply (space-separated); empty = Dockerfile default"
+        description: "upstream llama.cpp PR numbers to merge (space-separated); empty = Dockerfile default"
         required: false
         default: ""
 
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
+
+# Two published images from one Dockerfile (WITH_ROCM build arg):
+#   :latest  Vulkan only  -- every push / weekly schedule / manual run
+#   :rocm    Vulkan+ROCm  -- manual run with the "rocm" checkbox; the three HIP
+#            stages are fat multi-gfx builds that take hours on a runner.
 
 jobs:
   # Lint, and pin the base image + image name once so every job in this run
@@ -61,39 +71,22 @@ jobs:
           echo "Pinned unified-vulkan @ ${DIGEST}"
           echo "ref=ghcr.io/mostlygeek/llama-swap@${DIGEST}" >> "$GITHUB_OUTPUT"
 
-  # Each builder stage runs as its own job: the ROCm ones are fat HIP builds
-  # (11 gfx targets), the Vulkan ones compile hundreds of shader variants.
-  # One job per stage keeps every job well under the 6h runner limit and
-  # builds them in parallel. Results land in per-stage registry caches that
-  # the assemble job reuses.
-  build-stages:
+  # One job per builder stage, in parallel; results land in per-stage registry
+  # caches that the assemble jobs reuse. Vulkan stages always run.
+  build-stages-vulkan:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
-        target: [llama-rocm, whisper-rocm, sd-rocm, llama-vulkan, whisper-vulkan, sd-vulkan]
+        target: [llama-vulkan, whisper-vulkan, sd-vulkan]
     steps:
       - uses: actions/checkout@v7
-
-      # ROCm dev base + build trees are large; stock runners have ~20 GB free
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
       - uses: docker/setup-buildx-action@v4
-
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
@@ -101,7 +94,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Build ${{ matrix.target }} stage
         uses: docker/build-push-action@v7
         with:
@@ -116,20 +108,23 @@ jobs:
           cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }}
           cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache-{1},mode=max', needs.prepare.outputs.image, matrix.target) || '' }}
 
-  # Assemble the final image from the cached stages and push it. Skipped on
-  # PRs: without pushed stage caches it would recompile everything serially
-  # and overrun the job limit; the matrix above already validates the builds.
-  build:
-    if: github.event_name != 'pull_request'
-    needs: [prepare, build-stages]
+  # The ROCm stages are fat HIP builds (8 gfx targets, all-quant flash
+  # attention): only on a manual run with the "rocm" checkbox.
+  build-stages-rocm:
+    if: github.event_name == 'workflow_dispatch' && inputs.rocm
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [llama-rocm, whisper-rocm, sd-rocm]
     steps:
       - uses: actions/checkout@v7
-
+      # ROCm dev base + build trees are large; stock runners have ~20 GB free
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -140,16 +135,46 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: true
-
       - uses: docker/setup-buildx-action@v4
-
       - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build ${{ matrix.target }} stage
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            BASE_IMAGE=${{ needs.prepare.outputs.base }}
+            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
+            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+          cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }}
+          cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }},mode=max
 
+  # Vulkan-only image -> :latest (+ sha / schedule-date tags). Skipped on PRs:
+  # the matrix above already validates the builds.
+  build:
+    if: github.event_name != 'pull_request'
+    needs: [prepare, build-stages-vulkan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@v6
@@ -162,9 +187,8 @@ jobs:
             type=schedule,pattern={{date 'YYYYMMDD'}}
           labels: |
             org.opencontainers.image.title=llama-swap-amd
-            org.opencontainers.image.description=llama-swap unified image for AMD GPUs (ROCm + Vulkan)
-
-      - name: Build and push
+            org.opencontainers.image.description=llama-swap unified image for AMD GPUs (Vulkan; see :rocm for Vulkan+ROCm)
+      - name: Build and push (Vulkan only)
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -174,15 +198,75 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BASE_IMAGE=${{ needs.prepare.outputs.base }}
+            WITH_ROCM=false
             ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
             ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
-          # GHA cache caps at 10 GB — far too small here, so cache in the registry
+          # GHA cache caps at 10 GB -- far too small here, so cache in the registry
           cache-from: |
-            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-rocm
-            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-rocm
-            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-rocm
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache,mode=max
+
+  # Full Vulkan+ROCm image -> :rocm (+ rocm-<sha>), manual runs only.
+  build-rocm:
+    if: github.event_name == 'workflow_dispatch' && inputs.rocm
+    needs: [prepare, build-stages-vulkan, build-stages-rocm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ needs.prepare.outputs.image }}
+          tags: |
+            type=raw,value=rocm
+            type=sha,format=short,prefix=rocm-
+          labels: |
+            org.opencontainers.image.title=llama-swap-amd
+            org.opencontainers.image.description=llama-swap unified image for AMD GPUs (Vulkan + ROCm)
+      - name: Build and push (Vulkan + ROCm)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BASE_IMAGE=${{ needs.prepare.outputs.base }}
+            WITH_ROCM=true
+            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
+            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+          cache-from: |
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-rocm
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-rocm
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-rocm
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-rocm
+          cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-rocm,mode=max

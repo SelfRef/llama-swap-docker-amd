@@ -11,7 +11,8 @@
 #       llama-server-rocm, llama-cli-rocm, llama-tts-rocm, llama-bench-rocm,
 #       whisper-server-rocm, whisper-cli-rocm, sd-server-rocm, sd-cli-rocm
 #   - REBUILT Vulkan binaries of llama.cpp, whisper.cpp and sd.cpp that
-#     REPLACE the base image's. Why: upstream builds them on Ubuntu 24.04 with
+#     REPLACE the base image's (sd-server additionally gets its web UI
+#     embedded -- upstream builds it without, see the sd-frontend stage). Why: upstream builds them on Ubuntu 24.04 with
 #     its stock glslc (shaderc 2023.8 / glslang 14), which cannot compile the
 #     GL_EXT_integer_dot_product and GL_EXT_bfloat16 shaders, so llama.cpp's
 #     CMake silently drops those code paths (the device line at startup shows
@@ -65,6 +66,12 @@ ARG BASE_IMAGE=ghcr.io/mostlygeek/llama-swap:unified-vulkan
 
 ARG ROCM_VERSION=7.2.4
 
+# Build the ROCm side at all? true = full image (Vulkan + ROCm runtime + *-rocm
+# binaries); false = Vulkan-only image, the three HIP builder stages are not even
+# started (BuildKit only builds stages the final one references). CI publishes
+# the Vulkan-only image as `latest` and the full one as `rocm` on request.
+ARG WITH_ROCM=true
+
 # gfx architectures compiled into the HIP binaries: RDNA2 (gfx1030), RDNA3/3.5
 # (gfx1100/01/02, gfx1150/51), RDNA4 (gfx1200/01) -- the consumer/APU cards this
 # image is for. The CDNA data-center targets of llama.cpp's official ROCm image
@@ -104,6 +111,10 @@ ARG LLAMA_COMMIT="master"
 # and #26284 carries RDNA4 changes its maintainer wants dropped), #22970
 # (stale, conflicts with master).
 ARG LLAMA_PATCHES="27952"
+
+# Source of the fixed Qwen chat template shipped at
+# /etc/llama-swap/templates/qwen-fixed.jinja (fetched at build time).
+ARG QWEN_TEMPLATE_URL="https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/resolve/main/chat_template.jinja"
 
 # Newer Mesa (RADV, the Vulkan driver) for the final image. Ubuntu 24.04's
 # stock Mesa 25.2 is a year behind; kisak-mesa tracks the current stable
@@ -306,10 +317,38 @@ for bin in whisper-server whisper-cli; do
 done
 BUILD
 
+# ── sd-server web UI (built once, embedded into both sd-server builds) ──
+# sd.cpp embeds its frontend (the sdcpp-webui submodule, pinned per revision)
+# when CMake finds pnpm -- or a pre-generated frontend/dist/gen_index_html.h.
+# Upstream's builder has neither, so its sd-server answers "/" with a text
+# placeholder. Build the header here with Node and hand it to the C++ stages.
+
+FROM node:22-alpine AS sd-frontend
+RUN apk add --no-cache git && corepack enable
+COPY --from=vulkan-base /versions.txt /build/versions.txt
+ARG SD_COMMIT=""
+RUN <<'BUILD'
+#!/bin/sh
+set -eu
+COMMIT="${SD_COMMIT:-$(awk '$1=="stable-diffusion.cpp:"{print $2}' /build/versions.txt)}"
+[ -n "$COMMIT" ] || { echo "FATAL: no stable-diffusion.cpp commit" >&2; exit 1; }
+mkdir -p /src/sd && cd /src/sd
+git init -q && git remote add origin https://github.com/leejet/stable-diffusion.cpp.git
+git fetch --depth=1 origin "${COMMIT}" && git checkout -q FETCH_HEAD
+git submodule update --init --depth=1 examples/server/frontend
+cd examples/server/frontend
+echo "sd_frontend: $(git rev-parse HEAD)" > /src/frontend-version
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm run build:header
+[ -f dist/gen_index_html.h ] || { echo "FATAL: gen_index_html.h not produced" >&2; exit 1; }
+BUILD
+
 # ── Build stable-diffusion.cpp (Vulkan) ────────────────────────────────
 
 FROM vulkan-builder AS sd-vulkan
 ARG SD_COMMIT=""
+COPY --from=sd-frontend /src/sd/examples/server/frontend/dist/gen_index_html.h /src/frontend-version /tmp/sd-frontend/
 RUN --mount=type=cache,id=ccache-vulkan,target=/ccache <<'BUILD'
 #!/bin/bash
 set -euo pipefail
@@ -324,8 +363,12 @@ git remote add origin https://github.com/leejet/stable-diffusion.cpp.git
 git fetch --depth=1 origin "${COMMIT}"
 git checkout -q FETCH_HEAD
 git submodule update --init --recursive --depth=1
+# Pre-built web UI header (see the sd-frontend stage) -> embedded frontend
+mkdir -p examples/server/frontend/dist
+cp /tmp/sd-frontend/gen_index_html.h examples/server/frontend/dist/
 
 echo "=== Building stable-diffusion.cpp (Vulkan) ==="
+mkdir -p build
 cmake -B build \
     -DGGML_NATIVE=OFF \
     -DGGML_VULKAN=ON \
@@ -333,11 +376,15 @@ cmake -B build \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER_LAUNCHER=ccache \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-    -DSD_BUILD_EXAMPLES=ON
+    -DSD_BUILD_EXAMPLES=ON \
+    2>&1 | tee /tmp/configure.log
+grep -q "using pre-built frontend header" /tmp/configure.log \
+    || { echo "FATAL: sd-server would be built WITHOUT its web UI (pre-built header not picked up)" >&2; exit 1; }
 cmake --build build --config Release -j"$(nproc)" \
     --target sd-server sd-cli
 
 mkdir -p /install/bin
+cp /tmp/sd-frontend/frontend-version /install/sd-frontend-version
 for bin in sd-server sd-cli; do
     [ -f "build/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
     if readelf -d "build/bin/$bin" | grep -q 'libggml\|libstable'; then
@@ -518,6 +565,7 @@ BUILD
 
 FROM rocm-builder AS sd-rocm
 ARG SD_COMMIT=""
+COPY --from=sd-frontend /src/sd/examples/server/frontend/dist/gen_index_html.h /src/frontend-version /tmp/sd-frontend/
 RUN --mount=type=cache,id=ccache-rocm,target=/ccache <<'BUILD'
 #!/bin/bash
 set -euo pipefail
@@ -532,6 +580,9 @@ git remote add origin https://github.com/leejet/stable-diffusion.cpp.git
 git fetch --depth=1 origin "${COMMIT}"
 git checkout -q FETCH_HEAD
 git submodule update --init --recursive --depth=1
+# Pre-built web UI header (see the sd-frontend stage) -> embedded frontend
+mkdir -p examples/server/frontend/dist
+cp /tmp/sd-frontend/gen_index_html.h examples/server/frontend/dist/
 
 echo "=== Building stable-diffusion.cpp (HIP) for ${AMDGPU_TARGETS} ==="
 # POSITION_INDEPENDENT_CODE: see llama.cpp stage (sd.cpp also sets it itself)
@@ -544,7 +595,10 @@ cmake -B build \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
     -DSD_BUILD_EXAMPLES=ON \
     -DSD_HIPBLAS=ON \
-    -DAMDGPU_TARGETS="${AMDGPU_TARGETS}"
+    -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
+    2>&1 | tee /tmp/configure.log
+grep -q "using pre-built frontend header" /tmp/configure.log \
+    || { echo "FATAL: sd-server would be built WITHOUT its web UI (pre-built header not picked up)" >&2; exit 1; }
 cmake --build build --config Release -j"$(nproc)" \
     --target sd-server sd-cli
 
@@ -561,13 +615,34 @@ for bin in sd-server sd-cli; do
 done
 BUILD
 
-# ── Final image: base + ROCm runtime + rebuilt binaries ────────────────
+# ── ROCm stage selection (WITH_ROCM) ───────────────────────────────────
+# Alias stages: the final stage copies from `<name>-sel`, which FROMs
+# `<name>-${WITH_ROCM}`; with false that resolves to this empty stand-in and the
+# HIP builders are never started.
+
+FROM alpine:3 AS rocm-none
+RUN mkdir -p /install/bin /install/llama-rocm
+
+FROM llama-rocm   AS llama-rocm-true
+FROM whisper-rocm AS whisper-rocm-true
+FROM sd-rocm      AS sd-rocm-true
+FROM rocm-none    AS llama-rocm-false
+FROM rocm-none    AS whisper-rocm-false
+FROM rocm-none    AS sd-rocm-false
+# COPY --from cannot expand variables, FROM can: select here.
+FROM llama-rocm-${WITH_ROCM}   AS llama-rocm-sel
+FROM whisper-rocm-${WITH_ROCM} AS whisper-rocm-sel
+FROM sd-rocm-${WITH_ROCM}      AS sd-rocm-sel
+
+# ── Final image: base (+ ROCm runtime) + rebuilt binaries ──────────────
 
 FROM vulkan-base AS final
 ARG ROCM_VERSION
 ARG AMDGPU_TARGETS
 ARG LLAMA_FA_ALL_QUANTS
 ARG MESA_PPA
+ARG QWEN_TEMPLATE_URL
+ARG WITH_ROCM
 
 LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-docker-amd" \
       org.opencontainers.image.description="llama-swap unified image for AMD GPUs (ROCm + Vulkan)"
@@ -579,7 +654,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 # hipblas/rocblas pull in the HIP runtime (libamdhip64), hsa-rocr, comgr etc.
 # via package dependencies. hipblaslt is explicit: rocBLAS dlopens it on some
 # architectures (gfx90a/gfx942/RDNA4), which no NEEDED-entry check can catch.
-RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
+RUN if [ "${WITH_ROCM}" = "true" ]; then \
+    apt-get update && apt-get install -y --no-install-recommends gnupg \
     && mkdir -p /etc/apt/keyrings \
     && curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
         | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg \
@@ -591,7 +667,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
     && apt-get install -y --no-install-recommends hipblas rocblas hipblaslt rocminfo \
     && rm -rf /var/lib/apt/lists/* \
     && echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf \
-    && ldconfig
+    && ldconfig; \
+    fi
 
 # Newer Mesa/RADV (Vulkan driver) for the Vulkan binaries, see MESA_PPA above.
 # Only mesa-vulkan-drivers (+ its deps) is upgraded, not the whole GL stack.
@@ -617,16 +694,30 @@ RUN rm -f /usr/local/bin/llama-server /usr/local/bin/llama-cli \
 COPY --from=llama-vulkan   /install/llama-vulkan/ /opt/llama-vulkan/
 COPY --from=whisper-vulkan /install/bin/ /usr/local/bin/
 COPY --from=sd-vulkan      /install/bin/ /usr/local/bin/
-COPY --from=llama-rocm     /install/llama-rocm/ /opt/llama-rocm/
-COPY --from=whisper-rocm   /install/bin/ /usr/local/bin/
-COPY --from=sd-rocm        /install/bin/ /usr/local/bin/
+COPY --from=sd-vulkan      /install/sd-frontend-version /tmp/sd-frontend-version
+COPY --from=llama-rocm-sel   /install/llama-rocm/ /opt/llama-rocm/
+COPY --from=whisper-rocm-sel /install/bin/ /usr/local/bin/
+COPY --from=sd-rocm-sel      /install/bin/ /usr/local/bin/
 RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
         ln -sf "/opt/llama-vulkan/$bin" "/usr/local/bin/$bin"; \
-        ln -sf "/opt/llama-rocm/$bin-rocm" "/usr/local/bin/$bin-rocm"; \
-    done
+        if [ "${WITH_ROCM}" = "true" ]; then \
+            ln -sf "/opt/llama-rocm/$bin-rocm" "/usr/local/bin/$bin-rocm"; \
+        fi; \
+    done \
+    && { [ "${WITH_ROCM}" = "true" ] || rmdir /opt/llama-rocm; }
 
 # Example config with both backends; override by mounting /etc/llama-swap/config
 COPY config/config.yaml /etc/llama-swap/config/config.yaml
+
+# froggeric's fixed Qwen 3.5/3.6/3.8 chat template (reasoning-depth default,
+# enable_thinking=false, history <think> extraction, tool-call wire format --
+# see the model card), for `--chat-template-file`. ADD from the URL: BuildKit
+# re-checks the remote file on every build (ETag/Last-Modified), so a rebuild
+# picks up a new template version even when the layer would otherwise be
+# cached. Path is stable; the version string is recorded in /versions.txt.
+ADD --chmod=0644 ${QWEN_TEMPLATE_URL} /etc/llama-swap/templates/qwen-fixed.jinja
+# --chmod also applies to the directory ADD creates; make it traversable.
+RUN chmod 755 /etc/llama-swap/templates
 
 # Fail the build if any binary or backend library has unresolved shared
 # libraries (catches a missing ROCm runtime package or a broken RPATH), and
@@ -636,10 +727,13 @@ COPY config/config.yaml /etc/llama-swap/config/config.yaml
 RUN <<'CHECK'
 #!/bin/bash
 set -euo pipefail
-for bin in llama-server llama-cli llama-tts llama-bench \
-           llama-server-rocm llama-cli-rocm llama-tts-rocm llama-bench-rocm \
-           whisper-server whisper-cli whisper-server-rocm whisper-cli-rocm \
-           sd-server sd-cli sd-server-rocm sd-cli-rocm audiocpp_server; do
+BINS="llama-server llama-cli llama-tts llama-bench whisper-server whisper-cli sd-server sd-cli audiocpp_server"
+SERVERS="llama-server"
+if [ "${WITH_ROCM}" = "true" ]; then
+    BINS="$BINS llama-server-rocm llama-cli-rocm llama-tts-rocm llama-bench-rocm whisper-server-rocm whisper-cli-rocm sd-server-rocm sd-cli-rocm"
+    SERVERS="$SERVERS llama-server-rocm"
+fi
+for bin in $BINS; do
     out=$(ldd "$(readlink -f "$(command -v "$bin")")")
     if grep -q 'not found' <<<"$out"; then
         echo "FATAL: $bin has unresolved libraries:" >&2
@@ -647,12 +741,12 @@ for bin in llama-server llama-cli llama-tts llama-bench \
         exit 1
     fi
 done
-for lib in /opt/llama-vulkan/*.so* /opt/llama-rocm/*.so*; do
+for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*); do
     if ldd "$lib" | grep -q 'not found'; then
         echo "FATAL: $lib has unresolved libraries:" >&2; ldd "$lib" | grep 'not found' >&2; exit 1; fi
 done
 echo "All binaries and libraries resolve their shared libraries."
-for bin in llama-server llama-server-rocm; do
+for bin in $SERVERS; do
     "$bin" --version
     out=$("$bin" --list-devices 2>&1 || true)
     if ! grep -q "Available devices" <<<"$out"; then
@@ -663,13 +757,15 @@ done
 ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ' | sed 's/^/cpu variants: /; s/ $/\n/'
 CHECK
 
-RUN { echo "rocm: ${ROCM_VERSION}"; \
-      echo "amdgpu_targets: ${AMDGPU_TARGETS}"; \
+RUN { echo "with_rocm: ${WITH_ROCM}"; \
+      if [ "${WITH_ROCM}" = "true" ]; then echo "rocm: ${ROCM_VERSION}"; echo "amdgpu_targets: ${AMDGPU_TARGETS}"; fi; \
       echo "vulkan_rebuild: llama.cpp whisper.cpp stable-diffusion.cpp (base binaries replaced)"; \
+      echo "sd_server_webui: embedded ($(cut -d' ' -f2 /tmp/sd-frontend-version))"; rm -f /tmp/sd-frontend-version; \
       cat /opt/llama-vulkan/.build-info; \
-      cat /opt/llama-rocm/.build-info; \
+      if [ "${WITH_ROCM}" = "true" ]; then cat /opt/llama-rocm/.build-info; fi; \
       echo "cpu_variants: $(ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ')"; \
-      echo "mesa_ppa: ${MESA_PPA:-none}"; } >> /versions.txt \
+      echo "mesa_ppa: ${MESA_PPA:-none}"; \
+      echo "qwen_chat_template: $(grep -o 'template_version = "[^"]*"' /etc/llama-swap/templates/qwen-fixed.jinja | head -1 | cut -d'"' -f2) (${QWEN_TEMPLATE_URL})"; } >> /versions.txt \
     && cat /versions.txt
 
 # ENTRYPOINT, CMD, WORKDIR (/models) and ports are inherited from the base

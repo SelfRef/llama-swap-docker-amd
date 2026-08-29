@@ -9,11 +9,11 @@
 
 ## What's inside
 
-| Engine | Vulkan (rebuilt here) | ROCm (built here) |
+| Engine | Vulkan (rebuilt here, all tags) | ROCm (built here, `:rocm` tag only) |
 |---|---|---|
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `llama-server`, `llama-cli`, `llama-tts`, `llama-bench` | `llama-server-rocm`, `llama-cli-rocm`, `llama-tts-rocm`, `llama-bench-rocm` |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | `whisper-server`, `whisper-cli` | `whisper-server-rocm`, `whisper-cli-rocm` |
-| [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | `sd-server`, `sd-cli` | `sd-server-rocm`, `sd-cli-rocm` |
+| [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | `sd-server` (web UI embedded), `sd-cli` | `sd-server-rocm` (web UI embedded), `sd-cli-rocm` |
 | [audio.cpp](https://github.com/0xShug0/audio.cpp) | `audiocpp_server`, `audiocpp_cli` (from base image) | — (no HIP backend upstream) |
 | llama-swap + [vllm-wrapper](https://github.com/mostlygeek/llama-swap/tree/main/cmd/vllm-wrapper) | `llama-swap`, `vllm-wrapper` (backend-independent, from base image) | |
 
@@ -29,11 +29,14 @@ The larger measured win on current GPUs is the driver: the final image upgrades 
 
 ## Get the image
 
-Prebuilt by [GitHub Actions](.github/workflows/build.yml) on every change and weekly (to track the daily-rebuilt base image):
+Prebuilt by [GitHub Actions](.github/workflows/build.yml). Two tags from the same Dockerfile (`WITH_ROCM`):
 
 ```bash
-docker pull ghcr.io/selfref/llama-swap-docker-amd:latest
+docker pull ghcr.io/selfref/llama-swap-docker-amd:latest   # Vulkan only (~2 GB): every push + weekly rebuild
+docker pull ghcr.io/selfref/llama-swap-docker-amd:rocm     # Vulkan + ROCm (~10 GB): manual runs with the "rocm" checkbox
 ```
+
+The ROCm stages are fat multi-gfx HIP builds that take hours of runner time, so they are not part of the automatic builds: trigger the workflow by hand (Actions → Build image → Run workflow → tick **rocm**) whenever you want a fresh `:rocm`. The `*-rocm` binaries, the ROCm runtime and `rocminfo` exist only in that tag.
 
 Or build locally (expect a couple of hours for the fat HIP builds):
 
@@ -46,6 +49,7 @@ Build args:
 | Arg | Default | Purpose |
 |---|---|---|
 | `BASE_IMAGE` | `ghcr.io/mostlygeek/llama-swap:unified-vulkan` | Base image (must be the root variant, not `-rootless`). Pin a dated tag or digest for reproducibility. |
+| `WITH_ROCM` | `true` | `false` builds the Vulkan-only image (no HIP stages, no ROCm runtime); CI uses this for `:latest` |
 | `ROCM_VERSION` | `7.2.4` | ROCm version for both the builder image and the runtime apt packages |
 | `AMDGPU_TARGETS` | `gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201` | gfx architectures compiled into the HIP binaries (RDNA2/3/3.5/4). CDNA (`gfx908;gfx90a;gfx942`) is not included by default — add it if you run Instinct cards. Trim to just your GPU for a much faster build. |
 | `LLAMA_COMMIT` | `master` | llama.cpp revision for both the Vulkan and the ROCm build (sha, tag, branch, or `refs/pull/N/head`). `""` = the base image's commit from `/versions.txt`. Defaults to master so the PRs in `LLAMA_PATCHES` apply and the newest backend work is in. |
@@ -53,7 +57,18 @@ Build args:
 | `GLSLC_SUITE` | `resolute` | Ubuntu release whose `glslc`/`libshaderc1` are used by the Vulkan builder (only those two packages; everything else stays 24.04) |
 | `LLAMA_FA_ALL_QUANTS` | `ON` | ROCm llama.cpp: compile flash-attention kernels for all K/V cache quant combinations (without it only q8_0/q8_0 and q4_0/q4_0 stay on the GPU, see llama.cpp #27761). Set `OFF` for a faster build. |
 | `MESA_PPA` | `ppa:kisak/kisak-mesa` | Newer Mesa/RADV for the final image; `""` keeps the base image's stock Mesa 25.2 |
+| `QWEN_TEMPLATE_URL` | froggeric's `chat_template.jinja` | Source of the fixed Qwen chat template shipped at `/etc/llama-swap/templates/qwen-fixed.jinja` (see below) |
 | `LLAMA_PATCHES` | `27952` | Space-separated upstream llama.cpp PR numbers merged on top of `LLAMA_COMMIT` (both backends), fetched over git as `refs/pull/N/head`. A PR that is closed on GitHub is skipped with a notice; one that no longer merges cleanly fails the build — never a silent no-op. See [Trying upstream PRs](#trying-upstream-prs). |
+
+## Bundled chat template
+
+`/etc/llama-swap/templates/qwen-fixed.jinja` is [froggeric's fixed Qwen 3.5/3.6/3.8 chat template](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) (sane reasoning-depth default, working `enable_thinking=false`, history `<think>` extraction, robust tool-call arguments — see its model card). It is fetched at build time and refreshed on every rebuild (the version is in `/versions.txt` as `qwen_chat_template:`). Use it per model:
+
+```yaml
+cmd: >
+  llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL --port ${PORT}
+    --jinja --chat-template-file /etc/llama-swap/templates/qwen-fixed.jinja
+```
 
 ## Trying upstream PRs
 
@@ -127,6 +142,7 @@ docker run --rm --entrypoint cat ghcr.io/selfref/llama-swap-docker-amd:latest /v
 ## Notes
 
 - The image is large (~13–15 GB): the ROCm runtime with rocBLAS/hipBLASLt kernel libraries accounts for most of it.
+- `sd-server` (both backends) serves its web UI at `/` — upstream builds it without the frontend (no `pnpm` in its builder), so there `/` is a text placeholder and you need `--serve-html-path`. Here the pinned `sdcpp-webui` is built once (Node stage) and embedded; `/versions.txt` lists its commit as `sd_server_webui:`.
 - The Vulkan engines are NOT the base image's binaries (see above); `audiocpp_server`, `llama-swap` and `vllm-wrapper` are. The base image's shared `libggml*.so`/`libwhisper*.so` in `/usr/local/lib` are removed (nothing uses them any more).
 - The container runs as root (standard for ROCm images — device access works without any `--group-add`). Files created in `/models` will be root-owned on the host. If you run as a non-root user, pass the *numeric* host GIDs of your `video`/`render` groups (`--group-add $(getent group render | cut -d: -f3)`); the image has no `render` group, so adding it by name fails.
 - Verified on a Ryzen AI MAX+ 395 / Radeon 8060S (Strix Halo, gfx1151): both `llama-server --list-devices` (Vulkan/RADV) and `llama-server-rocm --list-devices` (ROCm) see the GPU. A gfx1100-only build also works on it with `HSA_OVERRIDE_GFX_VERSION=11.0.0`.
