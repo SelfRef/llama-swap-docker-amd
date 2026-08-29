@@ -42,7 +42,7 @@ jobs:
       image: ${{ steps.image.outputs.name }}
       base: ${{ steps.base.outputs.ref }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Lint Dockerfile
         run: docker build --check .
@@ -78,7 +78,7 @@ jobs:
       matrix:
         target: [llama-rocm, whisper-rocm, sd-rocm, llama-vulkan, whisper-vulkan, sd-vulkan]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # ROCm dev base + build trees are large; stock runners have ~20 GB free
       - name: Free disk space
@@ -92,18 +92,18 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build ${{ matrix.target }} stage
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: ${{ matrix.target }}
@@ -128,7 +128,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -141,10 +141,10 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -152,7 +152,7 @@ jobs:
 
       - name: Image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ needs.prepare.outputs.image }}
           tags: |
@@ -165,7 +165,7 @@ jobs:
             org.opencontainers.image.description=llama-swap unified image for AMD GPUs (ROCm + Vulkan)
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
