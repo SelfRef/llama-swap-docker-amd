@@ -1,8 +1,8 @@
 # llama-swap for AMD GPUs — ROCm + Vulkan in one image
 #
-# Extends the upstream unified Vulkan image (which already contains Vulkan
-# builds of llama.cpp, whisper.cpp, stable-diffusion.cpp and audio.cpp, plus
-# the llama-swap and vllm-wrapper binaries) with:
+# Extends the upstream unified Vulkan image (llama-swap, vllm-wrapper, and
+# Vulkan builds of llama.cpp, whisper.cpp, stable-diffusion.cpp, audio.cpp)
+# with:
 #
 #   - the ROCm userspace runtime (HIP runtime, rocBLAS/hipBLAS + Tensile
 #     kernels, hipBLASLt, rocminfo) from AMD's apt repository
@@ -10,11 +10,44 @@
 #     installed as *-rocm binaries next to the Vulkan ones:
 #       llama-server-rocm, llama-cli-rocm, llama-tts-rocm, llama-bench-rocm,
 #       whisper-server-rocm, whisper-cli-rocm, sd-server-rocm, sd-cli-rocm
+#   - REBUILT Vulkan binaries of llama.cpp, whisper.cpp and sd.cpp that
+#     REPLACE the base image's. Why: upstream builds them on Ubuntu 24.04 with
+#     its stock glslc (shaderc 2023.8 / glslang 14), which cannot compile the
+#     GL_EXT_integer_dot_product and GL_EXT_bfloat16 shaders, so llama.cpp's
+#     CMake silently drops those code paths (the device line at startup shows
+#     "int dot: 0 | bf16: 0" even though RADV advertises both). The integer
+#     dot path is the fast quantized prompt/matvec path on GPUs without
+#     cooperative-matrix support (q8_1 MMQ for K-quants: ~2x pp on RDNA2 in
+#     upstream's numbers, DP4A flash attention for q8_0/q4_0 KV caches, MMVQ
+#     decode); on coopmat GPUs (RDNA3+) llama.cpp keeps its FP16 coopmat
+#     matmul for prompts, so measured on an RX 7900 XTX the rebuild is
+#     neutral for prompt speed (+~2% decode) -- there the big win is the
+#     newer Mesa below. We build the same upstream commits on the same
+#     Ubuntu 24.04 ABI, but with glslc taken from the Ubuntu 26.04 pocket
+#     (see vulkan-builder), and verify at build time that the extensions are
+#     compiled in, so nothing is silently left out for any GPU.
+#   - llama.cpp (both backends) built with GGML_BACKEND_DL +
+#     GGML_CPU_ALL_VARIANTS: the CPU backend is compiled once per x86 feature
+#     level and the best one is picked at runtime, so a single image gets
+#     AVX2 on Zen 3 (e.g. 5950X) and AVX-512/VNNI/BF16 on Zen 4/5 (e.g. Strix
+#     Halo) for CPU-offloaded experts. Upstream ships one generic AVX2 build.
+#   - llama.cpp ROCm built with GGML_CUDA_FA_ALL_QUANTS so flash attention has
+#     kernels for every K/V cache type combination; without it only q8_0/q8_0
+#     and q4_0/q4_0 stay on the GPU and e.g. q8_0/q4_0 falls back to the CPU
+#     (upstream issue #27761: pp512 drops ~68%).
 #
-# The ROCm builds are pinned to the same project commits as the base image
-# (parsed from its /versions.txt), so both backends of each binary run the
-# same upstream revision. audio.cpp has no HIP backend upstream, so only its
-# Vulkan build is present.
+# whisper.cpp and sd.cpp are pinned to the commits recorded in the base
+# image's /versions.txt. llama.cpp is built from LLAMA_COMMIT (default: current
+# master) plus the upstream PRs in LLAMA_PATCHES, identically for Vulkan and
+# ROCm, so both backends are always the same revision; the built commit is
+# recorded in /versions.txt. audio.cpp has no HIP backend upstream and is left
+# as shipped by the base image (Vulkan, its own ggml fork).
+#
+# Layout: llama.cpp is installed as self-contained directories
+# /opt/llama-vulkan and /opt/llama-rocm (binaries + their shared libs, RPATH
+# $ORIGIN, ggml backends discovered next to the executable) with symlinks in
+# /usr/local/bin, so the two builds never share a libggml. whisper/sd binaries
+# are static.
 #
 # Build:
 #   docker buildx build -t llama-swap-amd .
@@ -26,11 +59,11 @@
 #
 # See README.md for build args, GPU support and runtime env vars.
 
-# Must be the root variant (not *-rootless): ROCm packages are installed with
-# apt in the final stage. Pin a dated tag or digest for reproducible builds.
+# Must be the root variant (not *-rootless): packages are installed with apt in
+# the final stage. Pin a dated tag or digest for reproducible builds.
 ARG BASE_IMAGE=ghcr.io/mostlygeek/llama-swap:unified-vulkan
 
-ARG ROCM_VERSION=7.2.1
+ARG ROCM_VERSION=7.2.4
 
 # Fat build covering everything rocBLAS ships Tensile kernels for -- same list
 # as llama.cpp's official ROCm image: CDNA1-3 (gfx908/90a/942), RDNA2 (gfx1030),
@@ -38,7 +71,270 @@ ARG ROCM_VERSION=7.2.1
 # here can still use the Vulkan binaries.
 ARG AMDGPU_TARGETS="gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201"
 
+# Ubuntu release whose glslc/libshaderc1 are installed into the (24.04) Vulkan
+# builder. Only those two packages come from it (per-package release selection
+# + low pin), everything else stays 24.04 so the binaries run on the base
+# image's glibc. 26.04 "resolute" ships shaderc 2026.1 / glslang 16.
+ARG GLSLC_SUITE=resolute
+
+# Compile flash-attention kernels for all K/V cache quant combinations in the
+# ROCm llama.cpp build (see header). Costs build time and binary size; set to
+# OFF to build faster.
+ARG LLAMA_FA_ALL_QUANTS=ON
+
+# llama.cpp revision for BOTH llama.cpp builds (Vulkan and ROCm). Default:
+# current master, so that the open PRs below apply and so the image carries the
+# newest backend work. Set "" to build exactly the base image's commit (from
+# /versions.txt), or pin a sha/tag. whisper.cpp and sd.cpp stay at the base
+# image's commits (no patches there).
+ARG LLAMA_COMMIT="master"
+
+# Upstream llama.cpp pull requests to apply on top of LLAMA_COMMIT, as a
+# space-separated list of PR numbers (fetched from github.com/.../pull/N.patch).
+# A patch that no longer applies is skipped if GitHub says the PR is merged
+# (the tree already has it) and FAILS the build otherwise, so drift is never a
+# silent no-op. Default: #27952 "vulkan: int8 coopmat1 matmul for AMD RDNA3/4"
+# (0cc4m) -- measured on an RX 7900 XTX: pp512 +4.6% dense (Q4_K_XL),
+# +18.5% MoE (Qwen3.6-35B-A3B Q4_K_M), decode unchanged. Remove it once merged
+# (the build tells you). Also measured and NOT adopted: #25483 (MoE coopmat
+# skip, +0.3%), #26284 + #26301 (HIP MMQ tuning / mmvdq: +2% pp, decode same,
+# and #26284 carries RDNA4 changes its maintainer wants dropped), #22970
+# (stale, conflicts with master).
+ARG LLAMA_PATCHES="27952"
+
+# Newer Mesa (RADV, the Vulkan driver) for the final image. Ubuntu 24.04's
+# stock Mesa 25.2 is a year behind; kisak-mesa tracks the current stable
+# release (26.1 at the time of writing). Measured on an RX 7900 XTX with the
+# SAME Vulkan binaries: pp512 693 -> 856 t/s (+24%), decode unchanged, and the
+# newer RADV exposes VK_VALVE_shader_mixed_float_dot_product (fp16 "dot2").
+# Set to "" to keep the base image's stock Mesa.
+ARG MESA_PPA="ppa:kisak/kisak-mesa"
+
 FROM ${BASE_IMAGE} AS vulkan-base
+
+# ── Vulkan builder: Ubuntu 24.04 ABI + modern glslc ────────────────────
+
+FROM ubuntu:24.04 AS vulkan-builder
+ARG GLSLC_SUITE
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CCACHE_DIR=/ccache
+ENV CCACHE_MAXSIZE=5G
+
+# libav*-dev only for whisper.cpp's WHISPER_FFMPEG=ON; the base runtime already
+# ships the matching Ubuntu 24.04 libav* runtime libraries.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git ccache curl ca-certificates \
+        pkg-config libssl-dev \
+        libvulkan-dev spirv-headers spirv-tools \
+        libavcodec-dev libavformat-dev libavutil-dev libswresample-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# glslc + libshaderc1 from the newer Ubuntu pocket, nothing else (pin 100 keeps
+# apt from preferring that release; the pkg/suite syntax selects it explicitly).
+# Their only dependencies are libc6 >= 2.38 / libstdc++6 >= 13.1, satisfied by
+# 24.04. The three feature tests below are the ones llama.cpp's CMake runs;
+# integer_dot and bfloat16 FAIL with 24.04's own glslc, which is the whole
+# reason this stage exists -- so a regression here must fail the build.
+RUN echo "deb http://archive.ubuntu.com/ubuntu ${GLSLC_SUITE} main universe" \
+        > /etc/apt/sources.list.d/glslc.list \
+    && printf 'Package: *\nPin: release n=%s\nPin-Priority: 100\n' "${GLSLC_SUITE}" \
+        > /etc/apt/preferences.d/glslc-suite \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends "glslc/${GLSLC_SUITE}" "libshaderc1/${GLSLC_SUITE}" \
+    && rm -rf /var/lib/apt/lists/* \
+    && glslc --version
+
+# The commit of each project built into the base image, so the rebuilds match
+# the upstream binaries exactly.
+COPY --from=vulkan-base /versions.txt /build/versions.txt
+
+WORKDIR /build
+
+# ── Build llama.cpp (Vulkan) ───────────────────────────────────────────
+
+FROM vulkan-builder AS llama-vulkan
+ARG LLAMA_COMMIT
+ARG LLAMA_PATCHES
+RUN --mount=type=cache,id=ccache-vulkan,target=/ccache <<'BUILD'
+#!/bin/bash
+set -euo pipefail
+
+COMMIT="${LLAMA_COMMIT:-$(awk '$1=="llama.cpp:"{print $2}' /build/versions.txt)}"
+[ -n "$COMMIT" ] || { echo "FATAL: no llama.cpp commit in versions.txt and no LLAMA_COMMIT given" >&2; exit 1; }
+
+echo "=== Cloning llama.cpp at ${COMMIT} ==="
+mkdir -p /src/llama.cpp && cd /src/llama.cpp
+git init -q
+git remote add origin https://github.com/ggml-org/llama.cpp.git
+git fetch --depth=1 origin "${COMMIT}"
+git checkout -q FETCH_HEAD
+
+for pr in ${LLAMA_PATCHES:-}; do
+    echo "=== Applying upstream PR #${pr} ==="
+    curl -fsSL --retry 8 --retry-delay 20 --retry-all-errors -o "/tmp/pr${pr}.patch" "https://github.com/ggml-org/llama.cpp/pull/${pr}.patch"
+    if git apply --check "/tmp/pr${pr}.patch" 2>/tmp/pr${pr}.err; then
+        git apply "/tmp/pr${pr}.patch"
+    else
+        # Already merged upstream (so the tree has it and the patch no longer
+        # applies)? Then skip quietly; anything else is a real drift -> fail.
+        merged=$(curl -fsSL --retry 5 --retry-delay 20 --retry-all-errors "https://api.github.com/repos/ggml-org/llama.cpp/pulls/${pr}"                  | grep -o '"merged": *[a-z]*' | head -1 | grep -o 'true\|false' || echo unknown)
+        if [ "$merged" = "true" ]; then
+            echo "PR #${pr} is already merged upstream -- skipping (remove it from LLAMA_PATCHES)"
+        else
+            echo "FATAL: PR #${pr} does not apply to ${COMMIT} (merged=${merged}):" >&2
+            cat /tmp/pr${pr}.err >&2; exit 1
+        fi
+    fi
+done
+
+echo "=== glslc feature tests (llama.cpp's own) ==="
+for t in integer_dot bfloat16 coopmat; do
+    f="ggml/src/ggml-vulkan/vulkan-shaders/feature-tests/$t.comp"
+    [ -f "$f" ] || { echo "(no feature test $t in this revision, skipping)"; continue; }
+    if glslc -o /dev/null -fshader-stage=compute --target-env=vulkan1.3 "$f" >/dev/null 2>&1; then
+        echo "  $t: OK"
+    else
+        echo "FATAL: glslc cannot compile $f -- the Vulkan rebuild would lose that code path" >&2
+        exit 1
+    fi
+done
+
+echo "=== Building llama.cpp (Vulkan) ==="
+# BACKEND_DL + CPU_ALL_VARIANTS need shared libs; building with the install
+# RPATH ($ORIGIN, nothing else) makes binaries + libs relocatable as one
+# directory (ggml also searches for its backend libs next to the executable).
+cmake -B build \
+    -DGGML_NATIVE=OFF \
+    -DGGML_VULKAN=ON \
+    -DBUILD_SHARED_LIBS=ON \
+    -DGGML_BACKEND_DL=ON \
+    -DGGML_CPU_ALL_VARIANTS=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+    -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+    2>&1 | tee /tmp/configure.log
+for ext in GL_EXT_integer_dot_product GL_EXT_bfloat16 GL_KHR_cooperative_matrix; do
+    line=$(grep -i "$ext" /tmp/configure.log || true)
+    echo "  cmake: ${line:-<no message for $ext>}"
+    if grep -qi "not supported" <<<"$line"; then
+        echo "FATAL: CMake reports $ext unsupported by glslc" >&2; exit 1; fi
+done
+# "all" so the per-feature-level ggml-cpu variants and the backend libs get
+# built too (they are not link-time dependencies of the executables).
+cmake --build build --config Release -j"$(nproc)"
+
+echo "=== Collecting ==="
+OUT=/install/llama-vulkan
+mkdir -p "$OUT"
+for bin in llama-server llama-cli llama-tts llama-bench; do
+    [ -f "build/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
+    cp "build/bin/$bin" "$OUT/"
+done
+cp -P build/bin/*.so* "$OUT/"
+ls "$OUT"/libggml-cpu-*.so >/dev/null 2>&1 || { echo "FATAL: no ggml-cpu variants built" >&2; exit 1; }
+ls "$OUT"/libggml-vulkan.so >/dev/null 2>&1 || { echo "FATAL: libggml-vulkan.so not built" >&2; exit 1; }
+# Relocatable check: nothing may still point at the build tree.
+# Relocatable check: every ELF's run path must start with $ORIGIN and must not
+# point into the build tree (CMake may append toolchain lib dirs such as
+# /opt/rocm-*/lib for the HIP backend -- those exist in the runtime image).
+for f in "$OUT"/*; do
+    [ -L "$f" ] && continue
+    rp=$(readelf -d "$f" 2>/dev/null | awk '/RUNPATH|RPATH/ {gsub(/[\[\]]/,"",$NF); print $NF}')
+    if [ -n "$rp" ] && { [[ "$rp" != '$ORIGIN'* ]] || [[ "$rp" == */src/* ]]; }; then
+        echo "FATAL: $f has run path '$rp' (expected \$ORIGIN[:...])" >&2; exit 1; fi
+    if ldd "$f" 2>/dev/null | grep -q "not found"; then
+        echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
+done
+echo "llama_vulkan_commit: $(git rev-parse HEAD) (requested: ${LLAMA_COMMIT:-base image})" > "$OUT/.build-info"
+echo "vulkan_glslc: $(glslc --version | head -1)" >> "$OUT/.build-info"
+echo "llama_patches: ${LLAMA_PATCHES:-none}" >> "$OUT/.build-info"
+BUILD
+
+# ── Build whisper.cpp (Vulkan) ─────────────────────────────────────────
+
+FROM vulkan-builder AS whisper-vulkan
+ARG WHISPER_COMMIT=""
+RUN --mount=type=cache,id=ccache-vulkan,target=/ccache <<'BUILD'
+#!/bin/bash
+set -euo pipefail
+
+COMMIT="${WHISPER_COMMIT:-$(awk '$1=="whisper.cpp:"{print $2}' /build/versions.txt)}"
+[ -n "$COMMIT" ] || { echo "FATAL: no whisper.cpp commit in versions.txt and no WHISPER_COMMIT given" >&2; exit 1; }
+
+echo "=== Cloning whisper.cpp at ${COMMIT} ==="
+mkdir -p /src/whisper.cpp && cd /src/whisper.cpp
+git init -q
+git remote add origin https://github.com/ggml-org/whisper.cpp.git
+git fetch --depth=1 origin "${COMMIT}"
+git checkout -q FETCH_HEAD
+
+echo "=== Building whisper.cpp (Vulkan, static) ==="
+# Static: the base image's whisper-server is the only user of the shared
+# libggml*.so in /usr/local/lib; static binaries let the final stage drop them.
+cmake -B build \
+    -DGGML_NATIVE=OFF \
+    -DGGML_VULKAN=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DWHISPER_FFMPEG=ON
+cmake --build build --config Release -j"$(nproc)" \
+    --target whisper-server whisper-cli
+
+mkdir -p /install/bin
+for bin in whisper-server whisper-cli; do
+    [ -f "build/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
+    if readelf -d "build/bin/$bin" | grep -q 'libggml\|libwhisper'; then
+        echo "FATAL: $bin is not statically linked against ggml/whisper" >&2; exit 1; fi
+    cp "build/bin/$bin" /install/bin/
+done
+BUILD
+
+# ── Build stable-diffusion.cpp (Vulkan) ────────────────────────────────
+
+FROM vulkan-builder AS sd-vulkan
+ARG SD_COMMIT=""
+RUN --mount=type=cache,id=ccache-vulkan,target=/ccache <<'BUILD'
+#!/bin/bash
+set -euo pipefail
+
+COMMIT="${SD_COMMIT:-$(awk '$1=="stable-diffusion.cpp:"{print $2}' /build/versions.txt)}"
+[ -n "$COMMIT" ] || { echo "FATAL: no stable-diffusion.cpp commit in versions.txt and no SD_COMMIT given" >&2; exit 1; }
+
+echo "=== Cloning stable-diffusion.cpp at ${COMMIT} ==="
+mkdir -p /src/stable-diffusion.cpp && cd /src/stable-diffusion.cpp
+git init -q
+git remote add origin https://github.com/leejet/stable-diffusion.cpp.git
+git fetch --depth=1 origin "${COMMIT}"
+git checkout -q FETCH_HEAD
+git submodule update --init --recursive --depth=1
+
+echo "=== Building stable-diffusion.cpp (Vulkan) ==="
+cmake -B build \
+    -DGGML_NATIVE=OFF \
+    -DGGML_VULKAN=ON \
+    -DSD_VULKAN=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DSD_BUILD_EXAMPLES=ON
+cmake --build build --config Release -j"$(nproc)" \
+    --target sd-server sd-cli
+
+mkdir -p /install/bin
+for bin in sd-server sd-cli; do
+    [ -f "build/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
+    if readelf -d "build/bin/$bin" | grep -q 'libggml\|libstable'; then
+        echo "FATAL: $bin expects shared ggml/sd libs" >&2; exit 1; fi
+    cp "build/bin/$bin" /install/bin/
+done
+BUILD
 
 # ── ROCm builder base ──────────────────────────────────────────────────
 
@@ -67,8 +363,9 @@ WORKDIR /build
 # ── Build llama.cpp (HIP) ──────────────────────────────────────────────
 
 FROM rocm-builder AS llama-rocm
-# Leave empty to build the same commit as the base image's Vulkan binaries
-ARG LLAMA_COMMIT=""
+ARG LLAMA_COMMIT
+ARG LLAMA_FA_ALL_QUANTS
+ARG LLAMA_PATCHES
 RUN --mount=type=cache,id=ccache-rocm,target=/ccache <<'BUILD'
 #!/bin/bash
 set -euo pipefail
@@ -83,35 +380,74 @@ git remote add origin https://github.com/ggml-org/llama.cpp.git
 git fetch --depth=1 origin "${COMMIT}"
 git checkout -q FETCH_HEAD
 
-echo "=== Building llama.cpp (HIP) for ${AMDGPU_TARGETS} ==="
+for pr in ${LLAMA_PATCHES:-}; do
+    echo "=== Applying upstream PR #${pr} ==="
+    curl -fsSL --retry 8 --retry-delay 20 --retry-all-errors -o "/tmp/pr${pr}.patch" "https://github.com/ggml-org/llama.cpp/pull/${pr}.patch"
+    if git apply --check "/tmp/pr${pr}.patch" 2>/tmp/pr${pr}.err; then
+        git apply "/tmp/pr${pr}.patch"
+    else
+        # Already merged upstream (so the tree has it and the patch no longer
+        # applies)? Then skip quietly; anything else is a real drift -> fail.
+        merged=$(curl -fsSL --retry 5 --retry-delay 20 --retry-all-errors "https://api.github.com/repos/ggml-org/llama.cpp/pulls/${pr}"                  | grep -o '"merged": *[a-z]*' | head -1 | grep -o 'true\|false' || echo unknown)
+        if [ "$merged" = "true" ]; then
+            echo "PR #${pr} is already merged upstream -- skipping (remove it from LLAMA_PATCHES)"
+        else
+            echo "FATAL: PR #${pr} does not apply to ${COMMIT} (merged=${merged}):" >&2
+            cat /tmp/pr${pr}.err >&2; exit 1
+        fi
+    fi
+done
+
+echo "=== Building llama.cpp (HIP) for ${AMDGPU_TARGETS}, FA_ALL_QUANTS=${LLAMA_FA_ALL_QUANTS} ==="
+# Shared + BACKEND_DL + CPU_ALL_VARIANTS like llama.cpp's own ROCm image; the
+# HIP backend lives in libggml-hip.so next to the binaries (RPATH $ORIGIN).
 # POSITION_INDEPENDENT_CODE: ggml-hip's device-stub objects are non-PIC by
-# default and fail to link into Ubuntu's default-PIE executables
+# default and fail to link into Ubuntu's default-PIE executables.
 HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
 cmake -B build \
     -DGGML_NATIVE=OFF \
-    -DBUILD_SHARED_LIBS=OFF \
+    -DGGML_HIP=ON \
+    -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
+    -DGGML_CUDA_FA_ALL_QUANTS="${LLAMA_FA_ALL_QUANTS}" \
+    -DBUILD_SHARED_LIBS=ON \
+    -DGGML_BACKEND_DL=ON \
+    -DGGML_CPU_ALL_VARIANTS=ON \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER_LAUNCHER=ccache \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
     -DLLAMA_BUILD_TESTS=OFF \
-    -DGGML_HIP=ON \
-    -DAMDGPU_TARGETS="${AMDGPU_TARGETS}"
-cmake --build build --config Release -j"$(nproc)" \
-    --target llama-server llama-cli llama-tts llama-bench
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+    -DCMAKE_INSTALL_RPATH='$ORIGIN'
+cmake --build build --config Release -j"$(nproc)"
 
-mkdir -p /install/bin
+echo "=== Collecting ==="
+OUT=/install/llama-rocm
+mkdir -p "$OUT"
 for bin in llama-server llama-cli llama-tts llama-bench; do
     [ -f "build/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
-    needed=$(readelf -d "build/bin/$bin" | grep NEEDED || true)
-    grep -q 'libamdhip64\.so' <<<"$needed" || {
-        echo "FATAL: $bin is not linked against the HIP runtime:" >&2
-        echo "$needed" >&2; exit 1; }
-    if grep -q 'libggml' <<<"$needed"; then
-        echo "FATAL: $bin expects shared ggml libs; it would collide with the" >&2
-        echo "       Vulkan libggml*.so already in the base image" >&2; exit 1; fi
-    cp "build/bin/$bin" "/install/bin/${bin}-rocm"
+    cp "build/bin/$bin" "$OUT/${bin}-rocm"
 done
+cp -P build/bin/*.so* "$OUT/"
+[ -f "$OUT/libggml-hip.so" ] || { echo "FATAL: libggml-hip.so not built" >&2; exit 1; }
+readelf -d "$OUT/libggml-hip.so" | grep -q 'libamdhip64\.so' || {
+    echo "FATAL: libggml-hip.so is not linked against the HIP runtime" >&2; exit 1; }
+ls "$OUT"/libggml-cpu-*.so >/dev/null 2>&1 || { echo "FATAL: no ggml-cpu variants built" >&2; exit 1; }
+# Relocatable check: every ELF's run path must start with $ORIGIN and must not
+# point into the build tree (CMake may append toolchain lib dirs such as
+# /opt/rocm-*/lib for the HIP backend -- those exist in the runtime image).
+for f in "$OUT"/*; do
+    [ -L "$f" ] && continue
+    rp=$(readelf -d "$f" 2>/dev/null | awk '/RUNPATH|RPATH/ {gsub(/[\[\]]/,"",$NF); print $NF}')
+    if [ -n "$rp" ] && { [[ "$rp" != '$ORIGIN'* ]] || [[ "$rp" == */src/* ]]; }; then
+        echo "FATAL: $f has run path '$rp' (expected \$ORIGIN[:...])" >&2; exit 1; fi
+    if ldd "$f" 2>/dev/null | grep -q "not found"; then
+        echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
+done
+echo "llama_rocm_commit: $(git rev-parse HEAD) (requested: ${LLAMA_COMMIT:-base image})" > "$OUT/.build-info"
+echo "rocm_fa_all_quants: ${LLAMA_FA_ALL_QUANTS}" >> "$OUT/.build-info"
+echo "llama_patches: ${LLAMA_PATCHES:-none}" >> "$OUT/.build-info"
 BUILD
 
 # ── Build whisper.cpp (HIP) ────────────────────────────────────────────
@@ -156,8 +492,7 @@ for bin in whisper-server whisper-cli; do
         echo "FATAL: $bin is not linked against the HIP runtime:" >&2
         echo "$needed" >&2; exit 1; }
     if grep -q 'libggml' <<<"$needed"; then
-        echo "FATAL: $bin expects shared ggml libs; it would collide with the" >&2
-        echo "       Vulkan libggml*.so already in the base image" >&2; exit 1; fi
+        echo "FATAL: $bin expects shared ggml libs" >&2; exit 1; fi
     cp "build/bin/$bin" "/install/bin/${bin}-rocm"
 done
 BUILD
@@ -204,17 +539,18 @@ for bin in sd-server sd-cli; do
         echo "FATAL: $bin is not linked against the HIP runtime:" >&2
         echo "$needed" >&2; exit 1; }
     if grep -q 'libggml' <<<"$needed"; then
-        echo "FATAL: $bin expects shared ggml libs; it would collide with the" >&2
-        echo "       Vulkan libggml*.so already in the base image" >&2; exit 1; fi
+        echo "FATAL: $bin expects shared ggml libs" >&2; exit 1; fi
     cp "build/bin/$bin" "/install/bin/${bin}-rocm"
 done
 BUILD
 
-# ── Final image: base + ROCm runtime + HIP binaries ────────────────────
+# ── Final image: base + ROCm runtime + rebuilt binaries ────────────────
 
 FROM vulkan-base AS final
 ARG ROCM_VERSION
 ARG AMDGPU_TARGETS
+ARG LLAMA_FA_ALL_QUANTS
+ARG MESA_PPA
 
 LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-docker-amd" \
       org.opencontainers.image.description="llama-swap unified image for AMD GPUs (ROCm + Vulkan)"
@@ -240,35 +576,83 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
     && echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf \
     && ldconfig
 
+# Newer Mesa/RADV (Vulkan driver) for the Vulkan binaries, see MESA_PPA above.
+# Only mesa-vulkan-drivers (+ its deps) is upgraded, not the whole GL stack.
+RUN if [ -n "${MESA_PPA}" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends software-properties-common \
+        && add-apt-repository -y "${MESA_PPA}" \
+        && apt-get install -y --no-install-recommends --only-upgrade mesa-vulkan-drivers \
+        && apt-get purge -y --auto-remove software-properties-common \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 ENV PATH="/opt/rocm/bin:${PATH}"
 
-COPY --from=llama-rocm   /install/bin/ /usr/local/bin/
-COPY --from=whisper-rocm /install/bin/ /usr/local/bin/
-COPY --from=sd-rocm      /install/bin/ /usr/local/bin/
+# Rebuilt Vulkan binaries replace the base image's (see header). The base's
+# shared libggml*/libwhisper* in /usr/local/lib were only used by its
+# whisper-server; ours are static, so they go too (a stale libggml-vulkan.so
+# there would otherwise be a trap for anyone dlopen-ing "the" ggml).
+RUN rm -f /usr/local/bin/llama-server /usr/local/bin/llama-cli \
+          /usr/local/bin/llama-tts /usr/local/bin/llama-bench \
+          /usr/local/lib/libggml*.so* /usr/local/lib/libwhisper*.so* \
+    && ldconfig
+COPY --from=llama-vulkan   /install/llama-vulkan/ /opt/llama-vulkan/
+COPY --from=whisper-vulkan /install/bin/ /usr/local/bin/
+COPY --from=sd-vulkan      /install/bin/ /usr/local/bin/
+COPY --from=llama-rocm     /install/llama-rocm/ /opt/llama-rocm/
+COPY --from=whisper-rocm   /install/bin/ /usr/local/bin/
+COPY --from=sd-rocm        /install/bin/ /usr/local/bin/
+RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
+        ln -sf "/opt/llama-vulkan/$bin" "/usr/local/bin/$bin"; \
+        ln -sf "/opt/llama-rocm/$bin-rocm" "/usr/local/bin/$bin-rocm"; \
+    done
 
 # Example config with both backends; override by mounting /etc/llama-swap/config
 COPY config/config.yaml /etc/llama-swap/config/config.yaml
 
-# Fail the build if any binary (new ROCm or inherited Vulkan) has unresolved
-# shared libraries -- this is what catches a missing ROCm runtime package.
+# Fail the build if any binary or backend library has unresolved shared
+# libraries (catches a missing ROCm runtime package or a broken RPATH), and
+# smoke-test that each llama-server starts, finds its ggml backends next to
+# itself and lists devices (no GPU here, so the list is empty -- the point is
+# that backend loading does not fail).
 RUN <<'CHECK'
 #!/bin/bash
 set -euo pipefail
-for bin in llama-server-rocm llama-cli-rocm llama-tts-rocm llama-bench-rocm \
-           whisper-server-rocm whisper-cli-rocm sd-server-rocm sd-cli-rocm \
-           llama-server whisper-server sd-server audiocpp_server; do
-    out=$(ldd "$(command -v "$bin")")
+for bin in llama-server llama-cli llama-tts llama-bench \
+           llama-server-rocm llama-cli-rocm llama-tts-rocm llama-bench-rocm \
+           whisper-server whisper-cli whisper-server-rocm whisper-cli-rocm \
+           sd-server sd-cli sd-server-rocm sd-cli-rocm audiocpp_server; do
+    out=$(ldd "$(readlink -f "$(command -v "$bin")")")
     if grep -q 'not found' <<<"$out"; then
         echo "FATAL: $bin has unresolved libraries:" >&2
         grep 'not found' <<<"$out" >&2
         exit 1
     fi
 done
-echo "All binaries resolve their shared libraries."
+for lib in /opt/llama-vulkan/*.so* /opt/llama-rocm/*.so*; do
+    if ldd "$lib" | grep -q 'not found'; then
+        echo "FATAL: $lib has unresolved libraries:" >&2; ldd "$lib" | grep 'not found' >&2; exit 1; fi
+done
+echo "All binaries and libraries resolve their shared libraries."
+for bin in llama-server llama-server-rocm; do
+    "$bin" --version
+    out=$("$bin" --list-devices 2>&1 || true)
+    if ! grep -q "Available devices" <<<"$out"; then
+        echo "FATAL: $bin --list-devices did not run (backend libs not found?):" >&2
+        echo "$out" >&2; exit 1
+    fi
+done
+ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ' | sed 's/^/cpu variants: /; s/ $/\n/'
 CHECK
 
 RUN { echo "rocm: ${ROCM_VERSION}"; \
-      echo "amdgpu_targets: ${AMDGPU_TARGETS}"; } >> /versions.txt \
+      echo "amdgpu_targets: ${AMDGPU_TARGETS}"; \
+      echo "vulkan_rebuild: llama.cpp whisper.cpp stable-diffusion.cpp (base binaries replaced)"; \
+      cat /opt/llama-vulkan/.build-info; \
+      cat /opt/llama-rocm/.build-info; \
+      echo "cpu_variants: $(ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ')"; \
+      echo "mesa_ppa: ${MESA_PPA:-none}"; } >> /versions.txt \
     && cat /versions.txt
 
 # ENTRYPOINT, CMD, WORKDIR (/models) and ports are inherited from the base
