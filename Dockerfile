@@ -112,9 +112,14 @@ ARG LLAMA_COMMIT="master"
 # (stale, conflicts with master).
 ARG LLAMA_PATCHES="27952"
 
-# Source of the fixed Qwen chat template shipped at
-# /etc/llama-swap/templates/qwen-fixed.jinja (fetched at build time).
+# Sources of the fixed Qwen chat templates shipped under
+# /etc/llama-swap/templates/ (fetched at build time):
+#   qwen-fixed.jinja -- froggeric's Qwen-Fixed-Chat-Templates (the base fix)
+#   qwen-sharp.jinja -- peculiar-ragdoll's Qwen-Sharp-Chat-Templates: froggeric's
+#                       template rebased with a terseness system prompt spliced in
+#                       (opt out per request with chat_template_kwargs {"terse": false})
 ARG QWEN_TEMPLATE_URL="https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/resolve/main/chat_template.jinja"
+ARG QWEN_SHARP_TEMPLATE_URL="https://huggingface.co/peculiar-ragdoll/Qwen-Sharp-Chat-Templates/resolve/main/chat_template.jinja"
 
 # Newer Mesa (RADV, the Vulkan driver) for the final image. Ubuntu 24.04's
 # stock Mesa 25.2 is a year behind; kisak-mesa tracks the current stable
@@ -642,6 +647,7 @@ ARG AMDGPU_TARGETS
 ARG LLAMA_FA_ALL_QUANTS
 ARG MESA_PPA
 ARG QWEN_TEMPLATE_URL
+ARG QWEN_SHARP_TEMPLATE_URL
 ARG WITH_ROCM
 
 LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-docker-amd" \
@@ -709,13 +715,19 @@ RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
 # Example config with both backends; override by mounting /etc/llama-swap/config
 COPY config/config.yaml /etc/llama-swap/config/config.yaml
 
-# froggeric's fixed Qwen 3.5/3.6/3.8 chat template (reasoning-depth default,
-# enable_thinking=false, history <think> extraction, tool-call wire format --
-# see the model card), for `--chat-template-file`. ADD from the URL: BuildKit
-# re-checks the remote file on every build (ETag/Last-Modified), so a rebuild
-# picks up a new template version even when the layer would otherwise be
-# cached. Path is stable; the version string is recorded in /versions.txt.
+# Fixed Qwen 3.5/3.6/3.8 chat templates for `--chat-template-file`:
+#   qwen-fixed.jinja -- froggeric's (reasoning-depth default, enable_thinking=false,
+#                       history <think> extraction, tool-call wire format -- see the
+#                       model card)
+#   qwen-sharp.jinja -- peculiar-ragdoll's Sharp variant: the same template with a
+#                       force-appended terseness system prompt (fewer filler tokens,
+#                       same kwargs; {"terse": false} in chat_template_kwargs drops it)
+# ADD from the URL: BuildKit re-checks the remote file on every build
+# (ETag/Last-Modified), so a rebuild picks up a new template version even when
+# the layer would otherwise be cached. Paths are stable; the version strings
+# are recorded in /versions.txt.
 ADD --chmod=0644 ${QWEN_TEMPLATE_URL} /etc/llama-swap/templates/qwen-fixed.jinja
+ADD --chmod=0644 ${QWEN_SHARP_TEMPLATE_URL} /etc/llama-swap/templates/qwen-sharp.jinja
 # --chmod also applies to the directory ADD creates; make it traversable.
 RUN chmod 755 /etc/llama-swap/templates
 
@@ -765,7 +777,8 @@ RUN { echo "with_rocm: ${WITH_ROCM}"; \
       if [ "${WITH_ROCM}" = "true" ]; then cat /opt/llama-rocm/.build-info; fi; \
       echo "cpu_variants: $(ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ')"; \
       echo "mesa_ppa: ${MESA_PPA:-none}"; \
-      echo "qwen_chat_template: $(grep -o 'template_version = "[^"]*"' /etc/llama-swap/templates/qwen-fixed.jinja | head -1 | cut -d'"' -f2) (${QWEN_TEMPLATE_URL})"; } >> /versions.txt \
+      echo "qwen_chat_template: $(grep -o 'template_version = "[^"]*"' /etc/llama-swap/templates/qwen-fixed.jinja | head -1 | cut -d'"' -f2) (${QWEN_TEMPLATE_URL})"; \
+      echo "qwen_sharp_chat_template: $(grep -o 'template_version = "[^"]*"' /etc/llama-swap/templates/qwen-sharp.jinja | head -1 | cut -d'"' -f2) (${QWEN_SHARP_TEMPLATE_URL})"; } >> /versions.txt \
     && cat /versions.txt
 
 # ENTRYPOINT, CMD, WORKDIR (/models) and ports are inherited from the base

@@ -58,11 +58,17 @@ Build args:
 | `LLAMA_FA_ALL_QUANTS` | `ON` | ROCm llama.cpp: compile flash-attention kernels for all K/V cache quant combinations (without it only q8_0/q8_0 and q4_0/q4_0 stay on the GPU, see llama.cpp #27761). Set `OFF` for a faster build. |
 | `MESA_PPA` | `ppa:kisak/kisak-mesa` | Newer Mesa/RADV for the final image; `""` keeps the base image's stock Mesa 25.2 |
 | `QWEN_TEMPLATE_URL` | froggeric's `chat_template.jinja` | Source of the fixed Qwen chat template shipped at `/etc/llama-swap/templates/qwen-fixed.jinja` (see below) |
+| `QWEN_SHARP_TEMPLATE_URL` | peculiar-ragdoll's `chat_template.jinja` | Source of the Sharp variant shipped at `/etc/llama-swap/templates/qwen-sharp.jinja` (see below) |
 | `LLAMA_PATCHES` | `27952` | Space-separated upstream llama.cpp PR numbers merged on top of `LLAMA_COMMIT` (both backends), fetched over git as `refs/pull/N/head`. A PR that is closed on GitHub is skipped with a notice; one that no longer merges cleanly fails the build — never a silent no-op. See [Trying upstream PRs](#trying-upstream-prs). |
 
-## Bundled chat template
+## Bundled chat templates
 
-`/etc/llama-swap/templates/qwen-fixed.jinja` is [froggeric's fixed Qwen 3.5/3.6/3.8 chat template](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) (sane reasoning-depth default, working `enable_thinking=false`, history `<think>` extraction, robust tool-call arguments — see its model card). It is fetched at build time and refreshed on every rebuild (the version is in `/versions.txt` as `qwen_chat_template:`). Use it per model:
+Two fixed Qwen 3.5/3.6/3.8 chat templates ship under `/etc/llama-swap/templates/`, both fetched at build time and refreshed on every rebuild (versions are in `/versions.txt` as `qwen_chat_template:` / `qwen_sharp_chat_template:`):
+
+- `qwen-fixed.jinja` — [froggeric's Qwen-Fixed-Chat-Templates](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates): sane reasoning-depth default, working `enable_thinking=false`, history `<think>` extraction, robust tool-call arguments — see its model card.
+- `qwen-sharp.jinja` — [peculiar-ragdoll's Qwen-Sharp-Chat-Templates](https://huggingface.co/peculiar-ragdoll/Qwen-Sharp-Chat-Templates): froggeric's template with a force-appended terseness system prompt (fewer filler/thinking tokens, same kwargs as above). Pass `{"terse": false}` in `chat_template_kwargs` to drop the appended prompt for a request.
+
+Use one per model:
 
 ```yaml
 cmd: >
