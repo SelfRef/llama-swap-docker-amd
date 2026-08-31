@@ -94,7 +94,26 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # GHCR intermittently answers blob GETs with 429 (sub-second retry-after)
+      # and buildx treats it as fatal, so retry the step once; the registry
+      # cache makes the second pass cheap.
       - name: Build ${{ matrix.target }} stage
+        id: build
+        continue-on-error: true
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            BASE_IMAGE=${{ needs.prepare.outputs.base }}
+            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
+            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+          cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache-{1},mode=max', needs.prepare.outputs.image, matrix.target) || '' }}
+      - name: Build ${{ matrix.target }} stage (retry)
+        if: steps.build.outcome == 'failure'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -142,7 +161,24 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Same 429 retry as in build-stages-vulkan.
       - name: Build ${{ matrix.target }} stage
+        id: build
+        continue-on-error: true
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            BASE_IMAGE=${{ needs.prepare.outputs.base }}
+            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
+            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+          cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }}
+          cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }},mode=max
+      - name: Build ${{ matrix.target }} stage (retry)
+        if: steps.build.outcome == 'failure'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -188,7 +224,10 @@ jobs:
           labels: |
             org.opencontainers.image.title=llama-swap-amd
             org.opencontainers.image.description=llama-swap unified image for AMD GPUs (Vulkan; see :rocm for Vulkan+ROCm)
+      # Same 429 retry as in build-stages-vulkan.
       - name: Build and push (Vulkan only)
+        id: build
+        continue-on-error: true
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -202,6 +241,26 @@ jobs:
             ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
             ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
           # GHA cache caps at 10 GB -- far too small here, so cache in the registry
+          cache-from: |
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache,mode=max
+      - name: Build and push (Vulkan only, retry)
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BASE_IMAGE=${{ needs.prepare.outputs.base }}
+            WITH_ROCM=false
+            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
+            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
           cache-from: |
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
@@ -248,7 +307,33 @@ jobs:
           labels: |
             org.opencontainers.image.title=llama-swap-amd
             org.opencontainers.image.description=llama-swap unified image for AMD GPUs (Vulkan + ROCm)
+      # Same 429 retry as in build-stages-vulkan.
       - name: Build and push (Vulkan + ROCm)
+        id: build
+        continue-on-error: true
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BASE_IMAGE=${{ needs.prepare.outputs.base }}
+            WITH_ROCM=true
+            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
+            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+          cache-from: |
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-rocm
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-rocm
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-rocm
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-rocm
+          cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-rocm,mode=max
+      - name: Build and push (Vulkan + ROCm, retry)
+        if: steps.build.outcome == 'failure'
         uses: docker/build-push-action@v7
         with:
           context: .
