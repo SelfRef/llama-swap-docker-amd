@@ -4,6 +4,7 @@
 
 - **Vulkan** (Mesa RADV) — works on practically any AMD GPU, including RDNA1/2, iGPUs/APUs and anything ROCm doesn't cover. The engines are **rebuilt here** at the base image's commits with a modern shader compiler (see [Why rebuild the Vulkan binaries](#why-rebuild-the-vulkan-binaries)) and the image ships a **current Mesa/RADV** instead of Ubuntu 24.04's.
 - **ROCm 7.2** (HIP) — added here: the full ROCm userspace runtime (HIP, rocBLAS/hipBLAS + Tensile kernels, hipBLASLt, `rocminfo`) plus HIP rebuilds of the engines, with flash-attention kernels for every KV-cache quant.
+- **EngramHalo.cpp** (HIP, `:rocm` tag, gfx1151 only) — [Aristo94's llama.cpp fork](https://github.com/Aristo94/EngramHalo.cpp) tuned for Qwen 3.8 Flash-Next on Strix Halo, as a third `llama.cpp` install (`*-engram` binaries). See [EngramHalo.cpp for Strix Halo](#engramhalocpp-for-strix-halo).
 
 `llama.cpp` is built from current master plus selected upstream PRs (`LLAMA_COMMIT`, `LLAMA_PATCHES`), and both backends of it are built with runtime CPU dispatch (`GGML_CPU_ALL_VARIANTS`), so one image gets AVX2 on Zen 3 and AVX-512/VNNI/BF16 on Zen 4/5 for CPU-offloaded layers. Every binary is compiled **from the exact same upstream commits** as the base image (parsed from its `/versions.txt`), so each engine ships as a matched Vulkan/ROCm pair — pick the backend per model in your llama-swap config.
 
@@ -12,12 +13,13 @@
 | Engine | Vulkan (rebuilt here, all tags) | ROCm (built here, `:rocm` tag only) |
 |---|---|---|
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `llama-server`, `llama-cli`, `llama-tts`, `llama-bench` | `llama-server-rocm`, `llama-cli-rocm`, `llama-tts-rocm`, `llama-bench-rocm` |
+| [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp) (llama.cpp fork, Strix Halo/qwen4exp) | — (fork is ROCm/HIP-only) | `llama-server-engram`, `llama-cli-engram`, `llama-bench-engram` (gfx1151 only) |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | `whisper-server`, `whisper-cli` | `whisper-server-rocm`, `whisper-cli-rocm` |
 | [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | `sd-server` (web UI embedded), `sd-cli` | `sd-server-rocm` (web UI embedded), `sd-cli-rocm` |
 | [audio.cpp](https://github.com/0xShug0/audio.cpp) | `audiocpp_server`, `audiocpp_cli` (from base image) | — (no HIP backend upstream) |
 | llama-swap + [vllm-wrapper](https://github.com/mostlygeek/llama-swap/tree/main/cmd/vllm-wrapper) | `llama-swap`, `vllm-wrapper` (backend-independent, from base image) | |
 
-llama.cpp lives in self-contained directories `/opt/llama-vulkan` and `/opt/llama-rocm` (binaries, `libllama`/`libggml*` and the per-CPU-level `libggml-cpu-*.so` variants, RPATH `$ORIGIN`) with symlinks in `/usr/local/bin`; whisper/sd binaries are static. `ik-llama-server` from the CUDA image is not included (upstream builds it CUDA-only). Exact versions of everything — including the glslc used and the enabled build options — are recorded in `/versions.txt` inside the image.
+llama.cpp lives in self-contained directories `/opt/llama-vulkan`, `/opt/llama-rocm` and `/opt/llama-engram` (binaries, `libllama`/`libggml*` and the per-CPU-level `libggml-cpu-*.so` variants, RPATH `$ORIGIN`) with symlinks in `/usr/local/bin`; whisper/sd binaries are static. `ik-llama-server` from the CUDA image is not included (upstream builds it CUDA-only). Exact versions of everything — including the glslc used and the enabled build options — are recorded in `/versions.txt` inside the image.
 
 ## Why rebuild the Vulkan binaries
 
@@ -36,7 +38,7 @@ docker pull ghcr.io/selfref/llama-swap-docker-amd:latest   # Vulkan only (~2 GB)
 docker pull ghcr.io/selfref/llama-swap-docker-amd:rocm     # Vulkan + ROCm (~10 GB): manual runs with the "rocm" checkbox
 ```
 
-The ROCm stages are fat multi-gfx HIP builds that take hours of runner time, so they are not part of the automatic builds: trigger the workflow by hand (Actions → Build image → Run workflow → tick **rocm**) whenever you want a fresh `:rocm`. The `*-rocm` binaries, the ROCm runtime and `rocminfo` exist only in that tag.
+The ROCm stages are fat multi-gfx HIP builds that take hours of runner time, so they are not part of the automatic builds: trigger the workflow by hand (Actions → Build image → Run workflow → tick **rocm**) whenever you want a fresh `:rocm`. The `*-rocm` binaries, the `*-engram` binaries (see [EngramHalo.cpp for Strix Halo](#engramhalocpp-for-strix-halo)), the ROCm runtime and `rocminfo` exist only in that tag.
 
 Or build locally (expect a couple of hours for the fat HIP builds):
 
@@ -56,6 +58,9 @@ Build args:
 | `WHISPER_COMMIT` / `SD_COMMIT` | *(empty)* | Override the project revision; empty means "same commit as the base image" |
 | `GLSLC_SUITE` | `resolute` | Ubuntu release whose `glslc`/`libshaderc1` are used by the Vulkan builder (only those two packages; everything else stays 24.04) |
 | `LLAMA_FA_ALL_QUANTS` | `ON` | ROCm llama.cpp: compile flash-attention kernels for all K/V cache quant combinations (without it only q8_0/q8_0 and q4_0/q4_0 stay on the GPU, see llama.cpp #27761). Set `OFF` for a faster build. |
+| `WITH_ENGRAM` | `true` | Build [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp) as `*-engram` binaries. Only takes effect together with `WITH_ROCM=true` (the fork is HIP-only), so `:latest` never contains it. `false` skips the stage. |
+| `ENGRAM_REPO` / `ENGRAM_BRANCH` | Aristo94's repo, `strix-halo-qwen4exp` | Fork source. The branch rebases onto llama.cpp master and carries the Strix Halo patch series. |
+| `ENGRAM_TARGETS` | `gfx1151` | gfx targets for the EngramHalo build. gfx1151 alone on purpose: the fork's kernels are tuned for and only validated on Strix Halo. |
 | `MESA_PPA` | `ppa:kisak/kisak-mesa` | Newer Mesa/RADV for the final image; `""` keeps the base image's stock Mesa 25.2 |
 | `QWEN_TEMPLATE_URL` | froggeric's `chat_template.jinja` | Source of the fixed Qwen chat template shipped at `/etc/llama-swap/templates/qwen-fixed.jinja` (see below) |
 | `QWEN_SHARP_TEMPLATE_URL` | peculiar-ragdoll's `chat_template.jinja` | Source of the Sharp variant shipped at `/etc/llama-swap/templates/qwen-sharp.jinja` (see below) |
@@ -75,6 +80,14 @@ cmd: >
   llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL --port ${PORT}
     --jinja --chat-template-file /etc/llama-swap/templates/qwen-fixed.jinja
 ```
+
+## EngramHalo.cpp for Strix Halo
+
+The `:rocm` tag ships [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp) (branch `strix-halo-qwen4exp`) as `llama-server-engram` / `llama-cli-engram` / `llama-bench-engram` — a llama.cpp fork tuned for **Qwen 3.8 Flash-Next on Strix Halo** (Ryzen AI MAX+ 395 / Radeon 8060S, gfx1151): QSA sparse-gather attention, a HIP wide top-k kernel, a chunked GATED_DELTA_NET prefill kernel, an MTP draft head for speculative decoding, and the model's 26.8 GiB engram/PLE table SSD-backed via `--tensor-read-lazy` (~1 GiB resident). The fork's in-tree patches (`docs/strix-halo/`) are applied at build time; the [#25992](https://github.com/ggml-org/llama.cpp/issues/25992) iGPU host-buffer workaround is treated as required (the build fails if it stops applying), the per-buffer mmap loader patch is skipped once obsolete.
+
+Measured on a 128 GB Strix Halo box (Qwen3.8-Flash-Next UD-Q4_K_XL, q8_0 KV, `--n-cpu-moe 24`, vs this image's stock `llama-server-rocm`): prompt processing 249 → 341–385 t/s at 11K, decode 11.3 → 15.5 t/s at 11K, and with the MTP sidecar 22–31 t/s on code at temp 0. Useful runtime env on gfx1151: `ROCBLAS_USE_HIPBLASLT=1`, `GGML_HIP_GDN_CHUNK=1`, `LLAMA_MMAP_DROP_BEHIND=1` (keeps the page cache warm behind a model-swapping proxy), and `LLAMA_QSA_GATHER=<n_kv threshold>` to tune when the sparse gather kicks in (default 16384). The MTP sidecar GGUF (draft weights, ~4 GB Q8_0) is at [EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF](https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF); pass it with `-md` plus `--spec-type draft-mtp,ngram-mod --spec-draft-n-max 4 --spec-draft-p-min 0.75` (the fork defaults — they also won a local parameter sweep; tune speculative params at temperature 0, acceptance noise at higher temperatures misleads). MTP is validated up to a 164K slot — cap `--ctx-size 163840` when using `-md`, or drop MTP for the full 262144.
+
+The binaries contain gfx1151 code only (`ENGRAM_TARGETS`) and exist only in the `:rocm` tag; on any other GPU, or for any other model, use `llama-server` / `llama-server-rocm`. The built fork commit is recorded in `/versions.txt` as `llama_engram_commit:`.
 
 ## Trying upstream PRs
 
@@ -159,4 +172,5 @@ docker run --rm --entrypoint cat ghcr.io/selfref/llama-swap-docker-amd:latest /v
 - [llama-swap unified container docs](https://github.com/mostlygeek/llama-swap/tree/main/docker/unified)
 - [llama.cpp ROCm Dockerfile](https://github.com/ggml-org/llama.cpp/blob/master/.devops/rocm.Dockerfile) (ROCm version + gfx target list followed here)
 - [whisper.cpp ROCm build docs](https://github.com/ggml-org/whisper.cpp#amd-rocm-gpu-support)
+- [EngramHalo.cpp Strix Halo docs](https://github.com/Aristo94/EngramHalo.cpp/blob/strix-halo-qwen4exp/docs/strix-halo/README.md) (fork background, benchmarks, MTP sidecar)
 - [ROCm apt installation](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/install-methods/package-manager-index.html)

@@ -10,6 +10,8 @@
 #     installed as *-rocm binaries next to the Vulkan ones:
 #       llama-server-rocm, llama-cli-rocm, llama-tts-rocm, llama-bench-rocm,
 #       whisper-server-rocm, whisper-cli-rocm, sd-server-rocm, sd-cli-rocm
+#   - EngramHalo.cpp (Aristo94's Strix Halo/qwen4exp fork of llama.cpp, HIP,
+#     gfx1151 only) as *-engram binaries -- see the WITH_ENGRAM arg below
 #   - REBUILT Vulkan binaries of llama.cpp, whisper.cpp and sd.cpp that
 #     REPLACE the base image's (sd-server additionally gets its web UI
 #     embedded -- upstream builds it without, see the sd-frontend stage). Why: upstream builds them on Ubuntu 24.04 with
@@ -91,6 +93,22 @@ ARG GLSLC_SUITE=resolute
 # ROCm llama.cpp build (see header). Costs build time and binary size; set to
 # OFF to build faster.
 ARG LLAMA_FA_ALL_QUANTS=ON
+
+# EngramHalo.cpp: Aristo94's llama.cpp fork tuned for Qwen 3.8 Flash-Next on
+# Strix Halo (gfx1151) — QSA sparse-gather attention, HIP wide top-k kernel,
+# MTP draft-head speculative decoding, SSD-backed engram (PLE/n-gram) table
+# via --tensor-read-lazy. Built as a FOURTH llama.cpp install
+# (/opt/llama-engram, *-engram binaries) next to the Vulkan and ROCm ones,
+# only when WITH_ROCM=true AND WITH_ENGRAM=true — the Vulkan-only image
+# (`latest`) never builds it (the fork is ROCm/HIP-only; Vulkan is reported a
+# net loss upstream). The fork's docs/strix-halo patches (#25992 iGPU
+# host-buffer workaround, per-buffer mmap loader) are applied when they still
+# fit the tree. ENGRAM_TARGETS is gfx1151 alone on purpose: the kernels are
+# tuned for and only validated on Strix Halo.
+ARG WITH_ENGRAM=true
+ARG ENGRAM_REPO=https://github.com/Aristo94/EngramHalo.cpp.git
+ARG ENGRAM_BRANCH=strix-halo-qwen4exp
+ARG ENGRAM_TARGETS=gfx1151
 
 # llama.cpp revision for BOTH llama.cpp builds (Vulkan and ROCm). Default:
 # current master, so that the open PRs below apply and so the image carries the
@@ -519,6 +537,83 @@ echo "rocm_fa_all_quants: ${LLAMA_FA_ALL_QUANTS}" >> "$OUT/.build-info"
 echo "llama_patches: ${LLAMA_PATCHES:-none}" >> "$OUT/.build-info"
 BUILD
 
+# ── Build EngramHalo.cpp (HIP, Strix Halo only) ────────────────────────
+
+FROM rocm-builder AS llama-engram
+ARG ENGRAM_REPO
+ARG ENGRAM_BRANCH
+ARG ENGRAM_TARGETS
+RUN --mount=type=cache,id=ccache-rocm,target=/ccache <<'BUILD'
+#!/bin/bash
+set -euo pipefail
+
+echo "=== Cloning EngramHalo.cpp (${ENGRAM_BRANCH}) ==="
+git clone --single-branch --branch "${ENGRAM_BRANCH}" --depth=1 \
+    --recurse-submodules --shallow-submodules "${ENGRAM_REPO}" /src/engram
+cd /src/engram
+echo "EngramHalo.cpp at $(git rev-parse HEAD)"
+
+# The branch ships its Strix Halo patches in-tree under docs/strix-halo/.
+# Same conditional logic as the fork's own Dockerfile.rocm-7.14: apply while
+# they fit, treat reverse-applying as already-upstream, and only the
+# correctness patch (#25992 multi-slot response mix-up on iGPUs) is fatal
+# when it neither applies nor is present.
+p=docs/strix-halo/llama-cpp-25992-rocm-host-buffer.patch
+if git apply --check "$p" 2>/dev/null; then git apply "$p"; echo "applied: $p"
+elif git apply --reverse --check "$p" 2>/dev/null; then echo "#25992 workaround already present upstream"
+else echo "FATAL: #25992 host-buffer workaround no longer applies -- multi-slot serving would return wrong responses; re-check the branch" >&2; exit 1
+fi
+p=docs/strix-halo/llama-cpp-qwen38-per-buffer-mmap.patch
+if git apply --check "$p" 2>/dev/null; then git apply "$p"; echo "applied: $p"
+else echo "per-buffer mmap loader patch skipped as obsolete"
+fi
+
+echo "=== Building EngramHalo.cpp (HIP) for ${ENGRAM_TARGETS} ==="
+# Same relocatable shared/BACKEND_DL layout as the llama-rocm stage. No
+# FA_ALL_QUANTS: this binary serves one model (q8_0/q8_0 KV) and the default
+# FA kernel set already covers q8_0/q8_0 and q4_0/q4_0.
+HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+cmake -B build \
+    -DGGML_NATIVE=OFF \
+    -DGGML_HIP=ON \
+    -DAMDGPU_TARGETS="${ENGRAM_TARGETS}" \
+    -DBUILD_SHARED_LIBS=ON \
+    -DGGML_BACKEND_DL=ON \
+    -DGGML_CPU_ALL_VARIANTS=ON \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+    -DCMAKE_INSTALL_RPATH='$ORIGIN'
+cmake --build build --config Release -j"$(nproc)"
+
+echo "=== Collecting ==="
+OUT=/install/llama-engram
+mkdir -p "$OUT"
+for bin in llama-server llama-cli llama-bench; do
+    [ -f "build/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
+    cp "build/bin/$bin" "$OUT/${bin}-engram"
+done
+cp -P build/bin/*.so* "$OUT/"
+[ -f "$OUT/libggml-hip.so" ] || { echo "FATAL: libggml-hip.so not built" >&2; exit 1; }
+readelf -d "$OUT/libggml-hip.so" | grep -q 'libamdhip64\.so' || {
+    echo "FATAL: libggml-hip.so is not linked against the HIP runtime" >&2; exit 1; }
+ls "$OUT"/libggml-cpu-*.so >/dev/null 2>&1 || { echo "FATAL: no ggml-cpu variants built" >&2; exit 1; }
+for f in "$OUT"/*; do
+    [ -L "$f" ] && continue
+    rp=$(readelf -d "$f" 2>/dev/null | awk '/RUNPATH|RPATH/ {gsub(/[\[\]]/,"",$NF); print $NF}')
+    if [ -n "$rp" ] && { [[ "$rp" != '$ORIGIN'* ]] || [[ "$rp" == */src/* ]]; }; then
+        echo "FATAL: $f has run path '$rp' (expected \$ORIGIN[:...])" >&2; exit 1; fi
+    if ldd "$f" 2>/dev/null | grep -q "not found"; then
+        echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
+done
+{ echo "llama_engram_commit: $(git rev-parse HEAD) (${ENGRAM_REPO} @ ${ENGRAM_BRANCH})";
+  echo "llama_engram_targets: ${ENGRAM_TARGETS}"; } > "$OUT/.build-info"
+BUILD
+
 # ── Build whisper.cpp (HIP) ────────────────────────────────────────────
 
 FROM rocm-builder AS whisper-rocm
@@ -626,7 +721,7 @@ BUILD
 # HIP builders are never started.
 
 FROM alpine:3 AS rocm-none
-RUN mkdir -p /install/bin /install/llama-rocm
+RUN mkdir -p /install/bin /install/llama-rocm /install/llama-engram
 
 FROM llama-rocm   AS llama-rocm-true
 FROM whisper-rocm AS whisper-rocm-true
@@ -639,6 +734,14 @@ FROM llama-rocm-${WITH_ROCM}   AS llama-rocm-sel
 FROM whisper-rocm-${WITH_ROCM} AS whisper-rocm-sel
 FROM sd-rocm-${WITH_ROCM}      AS sd-rocm-sel
 
+# Engram needs BOTH switches on (it links the ROCm runtime, which only the
+# WITH_ROCM image installs), so the selection key is the concatenated pair.
+FROM llama-engram AS llama-engram-true-true
+FROM rocm-none    AS llama-engram-true-false
+FROM rocm-none    AS llama-engram-false-true
+FROM rocm-none    AS llama-engram-false-false
+FROM llama-engram-${WITH_ROCM}-${WITH_ENGRAM} AS llama-engram-sel
+
 # ── Final image: base (+ ROCm runtime) + rebuilt binaries ──────────────
 
 FROM vulkan-base AS final
@@ -649,6 +752,7 @@ ARG MESA_PPA
 ARG QWEN_TEMPLATE_URL
 ARG QWEN_SHARP_TEMPLATE_URL
 ARG WITH_ROCM
+ARG WITH_ENGRAM
 
 LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-docker-amd" \
       org.opencontainers.image.description="llama-swap unified image for AMD GPUs (ROCm + Vulkan)"
@@ -704,13 +808,19 @@ COPY --from=sd-vulkan      /install/sd-frontend-version /tmp/sd-frontend-version
 COPY --from=llama-rocm-sel   /install/llama-rocm/ /opt/llama-rocm/
 COPY --from=whisper-rocm-sel /install/bin/ /usr/local/bin/
 COPY --from=sd-rocm-sel      /install/bin/ /usr/local/bin/
+COPY --from=llama-engram-sel /install/llama-engram/ /opt/llama-engram/
 RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
         ln -sf "/opt/llama-vulkan/$bin" "/usr/local/bin/$bin"; \
         if [ "${WITH_ROCM}" = "true" ]; then \
             ln -sf "/opt/llama-rocm/$bin-rocm" "/usr/local/bin/$bin-rocm"; \
         fi; \
     done \
-    && { [ "${WITH_ROCM}" = "true" ] || rmdir /opt/llama-rocm; }
+    && { [ "${WITH_ROCM}" = "true" ] || rmdir /opt/llama-rocm; } \
+    && if [ "${WITH_ROCM}" = "true" ] && [ "${WITH_ENGRAM}" = "true" ]; then \
+        for bin in llama-server llama-cli llama-bench; do \
+            ln -sf "/opt/llama-engram/$bin-engram" "/usr/local/bin/$bin-engram"; \
+        done; \
+    else rmdir /opt/llama-engram; fi
 
 # Example config with both backends; override by mounting /etc/llama-swap/config
 COPY config/config.yaml /etc/llama-swap/config/config.yaml
@@ -745,6 +855,10 @@ if [ "${WITH_ROCM}" = "true" ]; then
     BINS="$BINS llama-server-rocm llama-cli-rocm llama-tts-rocm llama-bench-rocm whisper-server-rocm whisper-cli-rocm sd-server-rocm sd-cli-rocm"
     SERVERS="$SERVERS llama-server-rocm"
 fi
+if [ "${WITH_ROCM}" = "true" ] && [ "${WITH_ENGRAM}" = "true" ]; then
+    BINS="$BINS llama-server-engram llama-cli-engram llama-bench-engram"
+    SERVERS="$SERVERS llama-server-engram"
+fi
 for bin in $BINS; do
     out=$(ldd "$(readlink -f "$(command -v "$bin")")")
     if grep -q 'not found' <<<"$out"; then
@@ -753,7 +867,7 @@ for bin in $BINS; do
         exit 1
     fi
 done
-for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*); do
+for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*) $([ -d /opt/llama-engram ] && echo /opt/llama-engram/*.so*); do
     if ldd "$lib" | grep -q 'not found'; then
         echo "FATAL: $lib has unresolved libraries:" >&2; ldd "$lib" | grep 'not found' >&2; exit 1; fi
 done
@@ -775,6 +889,7 @@ RUN { echo "with_rocm: ${WITH_ROCM}"; \
       echo "sd_server_webui: embedded ($(cut -d' ' -f2 /tmp/sd-frontend-version))"; rm -f /tmp/sd-frontend-version; \
       cat /opt/llama-vulkan/.build-info; \
       if [ "${WITH_ROCM}" = "true" ]; then cat /opt/llama-rocm/.build-info; fi; \
+      if [ -d /opt/llama-engram ]; then cat /opt/llama-engram/.build-info; fi; \
       echo "cpu_variants: $(ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ')"; \
       echo "mesa_ppa: ${MESA_PPA:-none}"; \
       echo "qwen_chat_template: $(grep -o 'template_version = "[^"]*"' /etc/llama-swap/templates/qwen-fixed.jinja | head -1 | cut -d'"' -f2) (${QWEN_TEMPLATE_URL})"; \

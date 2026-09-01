@@ -140,7 +140,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [llama-rocm, whisper-rocm, sd-rocm]
+        target: [llama-rocm, llama-engram, whisper-rocm, sd-rocm]
     steps:
       - uses: actions/checkout@v7
       # ROCm dev base + build trees are large; stock runners have ~20 GB free
@@ -328,6 +328,7 @@ jobs:
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-rocm
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-engram
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-rocm
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-rocm
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-rocm
@@ -351,6 +352,7 @@ jobs:
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-rocm
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-engram
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-rocm
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-rocm
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-rocm
