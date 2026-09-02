@@ -66,7 +66,27 @@
 # the final stage. Pin a dated tag or digest for reproducible builds.
 ARG BASE_IMAGE=ghcr.io/mostlygeek/llama-swap:unified-vulkan
 
+# ROCm source channel. AMD now ships ROCm through two repositories:
+#   multiarch (default) — repo.amd.com/rocm/packages-multi-arch/ubuntu2404:
+#     the current releases (ROCM_SERIES, e.g. 7.14 -> apt picks 7.14.1), split
+#     into per-gfx packages, so the runtime image carries BLAS kernels only
+#     for AMDGPU_TARGETS (~50 MB per arch) instead of the classic ~6 GB
+#     all-arch rocBLAS/hipBLASLt Tensile blobs. Installs under
+#     /opt/rocm/core-<series>/, symlinked back to the classic /opt/rocm
+#     layout in the stages below.
+#   classic — repo.radeon.com/rocm/apt + the rocm/dev-ubuntu-24.04 builder
+#     images: tops out at 7.2.4 (checked 2026-09-01) and carries the HIP
+#     graphs bug fixed in 7.13 (needs GGML_CUDA_DISABLE_GRAPHS=1, see
+#     llama.cpp discussion #27950). Kept as a fallback.
+ARG ROCM_CHANNEL=multiarch
+
+# classic channel only: builder image tag + apt repo path.
 ARG ROCM_VERSION=7.2.4
+
+# multiarch channel only: the release series embedded in the package names
+# (amdrocm-runtime7.14, amdrocm-blas7.14-gfx1151, ...); apt then resolves the
+# newest point release of that series. Bump when AMD publishes the next one.
+ARG ROCM_SERIES=7.14
 
 # Build the ROCm side at all? true = full image (Vulkan + ROCm runtime + *-rocm
 # binaries); false = Vulkan-only image, the three HIP builder stages are not even
@@ -109,34 +129,6 @@ ARG WITH_ENGRAM=true
 ARG ENGRAM_REPO=https://github.com/Aristo94/EngramHalo.cpp.git
 ARG ENGRAM_BRANCH=strix-halo-qwen4exp
 ARG ENGRAM_TARGETS=gfx1151
-
-# llama-server-qwen4exp: an EXTRA llama-server for Qwen3.8-Flash-Next (arch
-# qwen4exp), built from QWEN4EXP_COMMIT plus the open upstream PRs that
-# target the architecture and are not merged yet -- correctness fixes, decode/
-# prefill perf, and NextN/MTP speculative decoding (--spec-type draft-mtp with
-# unsloth's MTP/ sidecar drafters). Two builds from the same merged tree:
-#   Vulkan -> /opt/llama-qwen4exp/llama-server-qwen4exp   (WITH_QWEN4EXP)
-#   HIP    -> /opt/llama-qwen4exp-rocm/llama-server-qwen4exp-rocm
-#             (WITH_QWEN4EXP + WITH_ROCM, like the engram pairing; same
-#             AMDGPU_TARGETS / FA_ALL_QUANTS as llama-rocm. Note this llama.cpp
-#             has the ROCm radix TOP_K op (#27466), so the old
-#             --no-spec-draft-backend-sampling advice for MTP on HIP likely no
-#             longer applies -- re-verify on the Strix Halo.)
-# The stock llama-server is untouched. Remove PRs from the
-# list as they merge (a closed PR is skipped with a notice; a conflicting one
-# FAILS the build -- same drift rules as LLAMA_PATCHES). Local patches in
-# patches/ are applied on top and FAIL the build when they stop applying.
-# Current set (checked 2026-09-01):
-#   #28121 noscan ssm_a flags (CISC)      #27941 qwen4exp follow up fixes
-#   #28104 NextN/MTP port to master       #27992 O(log n) ngram prev-token index
-#   #28136 direct reads for the lazy PLE  #28118 spec checkpoints on-device
-#   #27952 vulkan int8 coopmat1 (same as LLAMA_PATCHES)
-# Evaluated and NOT taken: #27836+#28097 (competing MTP implementation,
-# conflicts with #28104), #27977 (overlaps #27992), #27879 (author-flagged
-# "cannot judge if correct").
-ARG WITH_QWEN4EXP=true
-ARG QWEN4EXP_COMMIT="master"
-ARG QWEN4EXP_PATCHES="28121 27941 28104 27992 28136 28118 27952"
 
 # llama.cpp revision for BOTH llama.cpp builds (Vulkan and ROCm). Default:
 # current master, so that the open PRs below apply and so the image carries the
@@ -327,117 +319,6 @@ echo "vulkan_glslc: $(glslc --version | head -1)" >> "$OUT/.build-info"
 echo "llama_patches: ${LLAMA_PATCHES:-none}" >> "$OUT/.build-info"
 BUILD
 
-# ── Build llama.cpp (Vulkan) + open qwen4exp PRs → llama-server-qwen4exp ─
-
-FROM vulkan-builder AS llama-qwen4exp
-ARG QWEN4EXP_COMMIT
-ARG QWEN4EXP_PATCHES
-COPY patches/ /build/qwen4exp-patches/
-RUN --mount=type=cache,id=ccache-vulkan,target=/ccache <<'BUILD'
-#!/bin/bash
-set -euo pipefail
-
-COMMIT="${QWEN4EXP_COMMIT:-master}"
-
-echo "=== Cloning llama.cpp at ${COMMIT} ==="
-mkdir -p /src/llama.cpp && cd /src/llama.cpp
-git init -q
-git remote add origin https://github.com/ggml-org/llama.cpp.git
-git fetch --filter=blob:none origin "${COMMIT}"
-git checkout -q FETCH_HEAD
-echo "llama.cpp at $(git rev-parse HEAD)"
-
-# Same PR-merge rules as the llama-vulkan stage: closed PRs are skipped (a
-# merged one is already in master), a conflicting merge FAILS the build.
-MERGED_PRS=""
-for pr in ${QWEN4EXP_PATCHES:-}; do
-    echo "=== Merging upstream PR #${pr} ==="
-    if ! git ls-remote --exit-code origin "refs/pull/${pr}/merge" >/dev/null 2>&1; then
-        echo "PR #${pr} is closed on GitHub (merged or rejected) -- skipping; remove it from QWEN4EXP_PATCHES"
-        continue
-    fi
-    git fetch --filter=blob:none origin "refs/pull/${pr}/head"
-    if git merge-base --is-ancestor FETCH_HEAD HEAD; then
-        echo "PR #${pr} is already contained in ${COMMIT} -- skipping"
-        continue
-    fi
-    git -c user.name=llama-swap-amd -c user.email=build@localhost \
-        merge --no-edit --no-ff -m "merge upstream PR #${pr}" FETCH_HEAD \
-        || { echo "FATAL: PR #${pr} does not merge cleanly into ${COMMIT} -- it has drifted, re-check it" >&2; exit 1; }
-    MERGED_PRS="${MERGED_PRS} ${pr}"
-done
-
-# Local patches on top (currently: load unsloth's MTP/ sidecar drafters, whose
-# hyper-connection mixer lives under blk.N.nextn.hc_head_* instead of the
-# trunk's top-level output_hc_*). Reverse-applying = already upstream: skip.
-for p in /build/qwen4exp-patches/*.patch; do
-    [ -e "$p" ] || continue
-    if git apply --check "$p" 2>/dev/null; then
-        git apply "$p"; echo "applied local patch: $(basename "$p")"
-    elif git apply --reverse --check "$p" 2>/dev/null; then
-        echo "local patch already upstream: $(basename "$p")"
-    else
-        echo "FATAL: local patch $(basename "$p") no longer applies -- rebase it against the merged tree" >&2
-        exit 1
-    fi
-done
-
-echo "=== glslc feature tests (llama.cpp's own) ==="
-for t in integer_dot bfloat16 coopmat; do
-    f="ggml/src/ggml-vulkan/vulkan-shaders/feature-tests/$t.comp"
-    [ -f "$f" ] || { echo "(no feature test $t in this revision, skipping)"; continue; }
-    if glslc -o /dev/null -fshader-stage=compute --target-env=vulkan1.3 "$f" >/dev/null 2>&1; then
-        echo "  $t: OK"
-    else
-        echo "FATAL: glslc cannot compile $f -- the Vulkan rebuild would lose that code path" >&2
-        exit 1
-    fi
-done
-
-echo "=== Building llama.cpp (Vulkan, qwen4exp) ==="
-cmake -B build \
-    -DGGML_NATIVE=OFF \
-    -DGGML_VULKAN=ON \
-    -DBUILD_SHARED_LIBS=ON \
-    -DGGML_BACKEND_DL=ON \
-    -DGGML_CPU_ALL_VARIANTS=ON \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-    -DLLAMA_BUILD_TESTS=OFF \
-    -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-    -DCMAKE_INSTALL_RPATH='$ORIGIN' \
-    2>&1 | tee /tmp/configure.log
-for ext in GL_EXT_integer_dot_product GL_EXT_bfloat16 GL_KHR_cooperative_matrix; do
-    line=$(grep -i "$ext" /tmp/configure.log || true)
-    echo "  cmake: ${line:-<no message for $ext>}"
-    if grep -qi "not supported" <<<"$line"; then
-        echo "FATAL: CMake reports $ext unsupported by glslc" >&2; exit 1; fi
-done
-cmake --build build --config Release -j"$(nproc)"
-
-echo "=== Collecting ==="
-OUT=/install/llama-qwen4exp
-mkdir -p "$OUT"
-[ -f build/bin/llama-server ] || { echo "FATAL: llama-server not built" >&2; exit 1; }
-cp build/bin/llama-server "$OUT/llama-server-qwen4exp"
-cp -P build/bin/*.so* "$OUT/"
-ls "$OUT"/libggml-cpu-*.so >/dev/null 2>&1 || { echo "FATAL: no ggml-cpu variants built" >&2; exit 1; }
-ls "$OUT"/libggml-vulkan.so >/dev/null 2>&1 || { echo "FATAL: libggml-vulkan.so not built" >&2; exit 1; }
-for f in "$OUT"/*; do
-    [ -L "$f" ] && continue
-    rp=$(readelf -d "$f" 2>/dev/null | awk '/RUNPATH|RPATH/ {gsub(/[\[\]]/,"",$NF); print $NF}')
-    if [ -n "$rp" ] && { [[ "$rp" != '$ORIGIN'* ]] || [[ "$rp" == */src/* ]]; }; then
-        echo "FATAL: $f has run path '$rp' (expected \$ORIGIN[:...])" >&2; exit 1; fi
-    if ldd "$f" 2>/dev/null | grep -q "not found"; then
-        echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
-done
-{ echo "llama_qwen4exp_commit: $(git rev-parse HEAD) (requested: ${COMMIT})";
-  echo "llama_qwen4exp_prs:${MERGED_PRS:- none}";
-  echo "llama_qwen4exp_local_patches: $(ls /build/qwen4exp-patches/*.patch 2>/dev/null | xargs -rn1 basename | tr '\n' ' ')"; } > "$OUT/.build-info"
-BUILD
-
 # ── Build whisper.cpp (Vulkan) ─────────────────────────────────────────
 
 FROM vulkan-builder AS whisper-vulkan
@@ -555,9 +436,59 @@ for bin in sd-server sd-cli; do
 done
 BUILD
 
+# ── ROCm toolchain (selected by ROCM_CHANNEL, see the arg) ─────────────
+
+# classic: AMD's prebuilt dev image; the build scripts derive HIPCXX/HIP_PATH
+# from its hipconfig.
+FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}-complete AS rocm-toolchain-classic
+
+# multiarch: plain Ubuntu 24.04 + the dev packages from
+# repo.amd.com/rocm/packages-multi-arch (AMD publishes no prebuilt dev image
+# for these releases). Everything lands under /opt/rocm/core-<series>/; the
+# classic layout is symlinked back so ROCM_PATH=/opt/rocm and the cmake
+# configs keep working. amdrocm-runtime-dev pulls the HIP headers/cmake and
+# the LLVM toolchain (amdclang++, device bitcode); blas-host/-dev +
+# hipblas-common-dev provide librocblas/libhipblas(lt) with headers and cmake
+# configs for ggml-hip's find_package(hipblas/rocblas); solver-host provides
+# librocsolver, which libhipblas.so references since 7.14 (static links fail
+# without it and the runtime needs it on the NEEDED chain); amdrocm-base has
+# rocminfo/rocm_agent_enumerator. There is no hipconfig here — HIPCXX and
+# HIP_PATH are exported instead and the build scripts prefer them when set.
+FROM ubuntu:24.04 AS rocm-toolchain-multiarch
+ARG ROCM_SERIES
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates gnupg \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg \
+        | gpg --dearmor -o /etc/apt/keyrings/rocm-multiarch.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm-multiarch.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" \
+        > /etc/apt/sources.list.d/rocm-multiarch.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        "amdrocm-runtime-dev${ROCM_SERIES}" \
+        "amdrocm-blas-host${ROCM_SERIES}" \
+        "amdrocm-blas-dev${ROCM_SERIES}" \
+        "amdrocm-hipblas-common-dev${ROCM_SERIES}" \
+        "amdrocm-solver-host${ROCM_SERIES}" \
+        "amdrocm-base${ROCM_SERIES}" \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s "core-${ROCM_SERIES}" /opt/rocm/core \
+    && for d in bin include lib libexec share; do \
+        ln -s "core-${ROCM_SERIES}/$d" "/opt/rocm/$d"; done \
+    && ln -s "core-${ROCM_SERIES}/lib/llvm" /opt/rocm/llvm \
+    && ln -s "core-${ROCM_SERIES}/lib/llvm/amdgcn" /opt/rocm/amdgcn \
+    && test -x /opt/rocm/lib/llvm/bin/amdclang++ \
+    && test -f /opt/rocm/lib/cmake/hip/hip-config.cmake
+ENV ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    HIPCXX=/opt/rocm/lib/llvm/bin/amdclang++ \
+    PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rocm/lib/rocm_sysdeps/lib:/opt/rocm/lib
+
 # ── ROCm builder base ──────────────────────────────────────────────────
 
-FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}-complete AS rocm-builder
+FROM rocm-toolchain-${ROCM_CHANNEL} AS rocm-builder
 ARG AMDGPU_TARGETS
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -629,7 +560,7 @@ echo "=== Building llama.cpp (HIP) for ${AMDGPU_TARGETS}, FA_ALL_QUANTS=${LLAMA_
 # HIP backend lives in libggml-hip.so next to the binaries (RPATH $ORIGIN).
 # POSITION_INDEPENDENT_CODE: ggml-hip's device-stub objects are non-PIC by
 # default and fail to link into Ubuntu's default-PIE executables.
-HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+HIPCXX="${HIPCXX:-$(hipconfig -l)/clang}" HIP_PATH="${HIP_PATH:-$(hipconfig -R)}" \
 cmake -B build \
     -DGGML_NATIVE=OFF \
     -DGGML_HIP=ON \
@@ -674,108 +605,6 @@ done
 echo "llama_rocm_commit: $(git rev-parse HEAD) (requested: ${LLAMA_COMMIT:-base image})" > "$OUT/.build-info"
 echo "rocm_fa_all_quants: ${LLAMA_FA_ALL_QUANTS}" >> "$OUT/.build-info"
 echo "llama_patches: ${LLAMA_PATCHES:-none}" >> "$OUT/.build-info"
-BUILD
-
-# ── Build llama.cpp (HIP) + open qwen4exp PRs → llama-server-qwen4exp-rocm ─
-# The HIP twin of the llama-qwen4exp stage: identical clone/merge/local-patch
-# logic (keep the two scripts in sync), built with the llama-rocm stage's HIP
-# flags. Only llama-server is shipped.
-
-FROM rocm-builder AS llama-qwen4exp-rocm
-ARG QWEN4EXP_COMMIT
-ARG QWEN4EXP_PATCHES
-ARG LLAMA_FA_ALL_QUANTS
-COPY patches/ /build/qwen4exp-patches/
-RUN --mount=type=cache,id=ccache-rocm,target=/ccache <<'BUILD'
-#!/bin/bash
-set -euo pipefail
-
-COMMIT="${QWEN4EXP_COMMIT:-master}"
-
-echo "=== Cloning llama.cpp at ${COMMIT} ==="
-mkdir -p /src/llama.cpp && cd /src/llama.cpp
-git init -q
-git remote add origin https://github.com/ggml-org/llama.cpp.git
-git fetch --filter=blob:none origin "${COMMIT}"
-git checkout -q FETCH_HEAD
-echo "llama.cpp at $(git rev-parse HEAD)"
-
-# Same PR-merge rules as the llama-vulkan stage: closed PRs are skipped (a
-# merged one is already in master), a conflicting merge FAILS the build.
-MERGED_PRS=""
-for pr in ${QWEN4EXP_PATCHES:-}; do
-    echo "=== Merging upstream PR #${pr} ==="
-    if ! git ls-remote --exit-code origin "refs/pull/${pr}/merge" >/dev/null 2>&1; then
-        echo "PR #${pr} is closed on GitHub (merged or rejected) -- skipping; remove it from QWEN4EXP_PATCHES"
-        continue
-    fi
-    git fetch --filter=blob:none origin "refs/pull/${pr}/head"
-    if git merge-base --is-ancestor FETCH_HEAD HEAD; then
-        echo "PR #${pr} is already contained in ${COMMIT} -- skipping"
-        continue
-    fi
-    git -c user.name=llama-swap-amd -c user.email=build@localhost \
-        merge --no-edit --no-ff -m "merge upstream PR #${pr}" FETCH_HEAD \
-        || { echo "FATAL: PR #${pr} does not merge cleanly into ${COMMIT} -- it has drifted, re-check it" >&2; exit 1; }
-    MERGED_PRS="${MERGED_PRS} ${pr}"
-done
-
-# Local patches on top; reverse-applying = already upstream: skip.
-for p in /build/qwen4exp-patches/*.patch; do
-    [ -e "$p" ] || continue
-    if git apply --check "$p" 2>/dev/null; then
-        git apply "$p"; echo "applied local patch: $(basename "$p")"
-    elif git apply --reverse --check "$p" 2>/dev/null; then
-        echo "local patch already upstream: $(basename "$p")"
-    else
-        echo "FATAL: local patch $(basename "$p") no longer applies -- rebase it against the merged tree" >&2
-        exit 1
-    fi
-done
-
-echo "=== Building llama.cpp (HIP, qwen4exp) for ${AMDGPU_TARGETS}, FA_ALL_QUANTS=${LLAMA_FA_ALL_QUANTS} ==="
-# Flags match the llama-rocm stage (see there for the PIC note).
-HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
-cmake -B build \
-    -DGGML_NATIVE=OFF \
-    -DGGML_HIP=ON \
-    -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
-    -DGGML_CUDA_FA_ALL_QUANTS="${LLAMA_FA_ALL_QUANTS}" \
-    -DBUILD_SHARED_LIBS=ON \
-    -DGGML_BACKEND_DL=ON \
-    -DGGML_CPU_ALL_VARIANTS=ON \
-    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-    -DLLAMA_BUILD_TESTS=OFF \
-    -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-    -DCMAKE_INSTALL_RPATH='$ORIGIN'
-cmake --build build --config Release -j"$(nproc)"
-
-echo "=== Collecting ==="
-OUT=/install/llama-qwen4exp-rocm
-mkdir -p "$OUT"
-[ -f build/bin/llama-server ] || { echo "FATAL: llama-server not built" >&2; exit 1; }
-cp build/bin/llama-server "$OUT/llama-server-qwen4exp-rocm"
-cp -P build/bin/*.so* "$OUT/"
-[ -f "$OUT/libggml-hip.so" ] || { echo "FATAL: libggml-hip.so not built" >&2; exit 1; }
-readelf -d "$OUT/libggml-hip.so" | grep -q 'libamdhip64\.so' || {
-    echo "FATAL: libggml-hip.so is not linked against the HIP runtime" >&2; exit 1; }
-ls "$OUT"/libggml-cpu-*.so >/dev/null 2>&1 || { echo "FATAL: no ggml-cpu variants built" >&2; exit 1; }
-for f in "$OUT"/*; do
-    [ -L "$f" ] && continue
-    rp=$(readelf -d "$f" 2>/dev/null | awk '/RUNPATH|RPATH/ {gsub(/[\[\]]/,"",$NF); print $NF}')
-    if [ -n "$rp" ] && { [[ "$rp" != '$ORIGIN'* ]] || [[ "$rp" == */src/* ]]; }; then
-        echo "FATAL: $f has run path '$rp' (expected \$ORIGIN[:...])" >&2; exit 1; fi
-    if ldd "$f" 2>/dev/null | grep -q "not found"; then
-        echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
-done
-{ echo "llama_qwen4exp_rocm_commit: $(git rev-parse HEAD) (requested: ${COMMIT})";
-  echo "llama_qwen4exp_rocm_prs:${MERGED_PRS:- none}";
-  echo "llama_qwen4exp_rocm_fa_all_quants: ${LLAMA_FA_ALL_QUANTS}";
-  echo "llama_qwen4exp_rocm_local_patches: $(ls /build/qwen4exp-patches/*.patch 2>/dev/null | xargs -rn1 basename | tr '\n' ' ')"; } > "$OUT/.build-info"
 BUILD
 
 # ── Build EngramHalo.cpp (HIP, Strix Halo only) ────────────────────────
@@ -875,7 +704,7 @@ git checkout -q FETCH_HEAD
 
 echo "=== Building whisper.cpp (HIP) for ${AMDGPU_TARGETS} ==="
 # POSITION_INDEPENDENT_CODE: see llama.cpp stage
-HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+HIPCXX="${HIPCXX:-$(hipconfig -l)/clang}" HIP_PATH="${HIP_PATH:-$(hipconfig -R)}" \
 cmake -B build \
     -DGGML_NATIVE=OFF \
     -DBUILD_SHARED_LIBS=OFF \
@@ -927,7 +756,7 @@ cp /tmp/sd-frontend/gen_index_html.h examples/server/frontend/dist/
 
 echo "=== Building stable-diffusion.cpp (HIP) for ${AMDGPU_TARGETS} ==="
 # POSITION_INDEPENDENT_CODE: see llama.cpp stage (sd.cpp also sets it itself)
-HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)" \
+HIPCXX="${HIPCXX:-$(hipconfig -l)/clang}" HIP_PATH="${HIP_PATH:-$(hipconfig -R)}" \
 cmake -B build \
     -DGGML_NATIVE=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -962,8 +791,7 @@ BUILD
 # HIP builders are never started.
 
 FROM alpine:3 AS rocm-none
-RUN mkdir -p /install/bin /install/llama-rocm /install/llama-engram \
-             /install/llama-qwen4exp /install/llama-qwen4exp-rocm
+RUN mkdir -p /install/bin /install/llama-rocm /install/llama-engram
 
 FROM llama-rocm   AS llama-rocm-true
 FROM whisper-rocm AS whisper-rocm-true
@@ -984,22 +812,12 @@ FROM rocm-none    AS llama-engram-false-true
 FROM rocm-none    AS llama-engram-false-false
 FROM llama-engram-${WITH_ROCM}-${WITH_ENGRAM} AS llama-engram-sel
 
-# The qwen4exp Vulkan build needs just WITH_QWEN4EXP.
-FROM llama-qwen4exp AS llama-qwen4exp-true
-FROM rocm-none      AS llama-qwen4exp-false
-FROM llama-qwen4exp-${WITH_QWEN4EXP} AS llama-qwen4exp-sel
-
-# Its HIP twin needs BOTH switches, like engram.
-FROM llama-qwen4exp-rocm AS llama-qwen4exp-rocm-true-true
-FROM rocm-none           AS llama-qwen4exp-rocm-true-false
-FROM rocm-none           AS llama-qwen4exp-rocm-false-true
-FROM rocm-none           AS llama-qwen4exp-rocm-false-false
-FROM llama-qwen4exp-rocm-${WITH_ROCM}-${WITH_QWEN4EXP} AS llama-qwen4exp-rocm-sel
-
 # ── Final image: base (+ ROCm runtime) + rebuilt binaries ──────────────
 
 FROM vulkan-base AS final
+ARG ROCM_CHANNEL
 ARG ROCM_VERSION
+ARG ROCM_SERIES
 ARG AMDGPU_TARGETS
 ARG LLAMA_FA_ALL_QUANTS
 ARG MESA_PPA
@@ -1007,7 +825,6 @@ ARG QWEN_TEMPLATE_URL
 ARG QWEN_SHARP_TEMPLATE_URL
 ARG WITH_ROCM
 ARG WITH_ENGRAM
-ARG WITH_QWEN4EXP
 
 LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-docker-amd" \
       org.opencontainers.image.description="llama-swap unified image for AMD GPUs (ROCm + Vulkan)"
@@ -1015,23 +832,46 @@ LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-doc
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
-# ROCm userspace from AMD's apt repo, matching the builder's ROCM_VERSION.
-# hipblas/rocblas pull in the HIP runtime (libamdhip64), hsa-rocr, comgr etc.
-# via package dependencies. hipblaslt is explicit: rocBLAS dlopens it on some
-# architectures (gfx90a/gfx942/RDNA4), which no NEEDED-entry check can catch.
+# ROCm userspace matching the builder's channel (see ROCM_CHANNEL).
+# classic: hipblas/rocblas pull in the HIP runtime (libamdhip64), hsa-rocr,
+# comgr etc. via package dependencies; hipblaslt is explicit — rocBLAS dlopens
+# it on some architectures (gfx90a/gfx942/RDNA4), which no NEEDED-entry check
+# can catch. This is the all-arch variant (~6 GB of kernels).
+# multiarch: HIP runtime + host-side BLAS libs + rocminfo (amdrocm-base) and
+# ONLY the per-gfx kernel packages for AMDGPU_TARGETS (~50 MB per arch);
+# layout is /opt/rocm/core-<series>/ symlinked to the classic paths, and
+# rocm_sysdeps (AMD's vendored deps the libs link against) needs its own
+# ld.so.conf entry.
 RUN if [ "${WITH_ROCM}" = "true" ]; then \
     apt-get update && apt-get install -y --no-install-recommends gnupg \
     && mkdir -p /etc/apt/keyrings \
-    && curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
-        | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg \
-    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" \
-        > /etc/apt/sources.list.d/rocm.list \
-    && printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
-        > /etc/apt/preferences.d/rocm-pin-600 \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends hipblas rocblas hipblaslt rocminfo \
+    && if [ "${ROCM_CHANNEL}" = "classic" ]; then \
+        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+            | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg \
+        && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" \
+            > /etc/apt/sources.list.d/rocm.list \
+        && printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
+            > /etc/apt/preferences.d/rocm-pin-600 \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends hipblas rocblas hipblaslt rocminfo \
+        && echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf; \
+    else \
+        curl -fsSL https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg \
+            | gpg --dearmor -o /etc/apt/keyrings/rocm-multiarch.gpg \
+        && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm-multiarch.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" \
+            > /etc/apt/sources.list.d/rocm-multiarch.list \
+        && apt-get update \
+        && PKGS="amdrocm-runtime${ROCM_SERIES} amdrocm-blas-host${ROCM_SERIES} amdrocm-solver-host${ROCM_SERIES} amdrocm-base${ROCM_SERIES}" \
+        && for t in $(echo "${AMDGPU_TARGETS}" | tr ';' ' '); do \
+            PKGS="$PKGS amdrocm-blas${ROCM_SERIES}-${t}"; done \
+        && apt-get install -y --no-install-recommends $PKGS \
+        && ln -s "core-${ROCM_SERIES}" /opt/rocm/core \
+        && for d in bin include lib libexec share; do \
+            ln -s "core-${ROCM_SERIES}/$d" "/opt/rocm/$d"; done \
+        && { echo /opt/rocm/lib; echo /opt/rocm/lib/rocm_sysdeps/lib; } \
+            > /etc/ld.so.conf.d/rocm.conf; \
+    fi \
     && rm -rf /var/lib/apt/lists/* \
-    && echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf \
     && ldconfig; \
     fi
 
@@ -1064,8 +904,6 @@ COPY --from=llama-rocm-sel   /install/llama-rocm/ /opt/llama-rocm/
 COPY --from=whisper-rocm-sel /install/bin/ /usr/local/bin/
 COPY --from=sd-rocm-sel      /install/bin/ /usr/local/bin/
 COPY --from=llama-engram-sel /install/llama-engram/ /opt/llama-engram/
-COPY --from=llama-qwen4exp-sel /install/llama-qwen4exp/ /opt/llama-qwen4exp/
-COPY --from=llama-qwen4exp-rocm-sel /install/llama-qwen4exp-rocm/ /opt/llama-qwen4exp-rocm/
 RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
         ln -sf "/opt/llama-vulkan/$bin" "/usr/local/bin/$bin"; \
         if [ "${WITH_ROCM}" = "true" ]; then \
@@ -1077,13 +915,7 @@ RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
         for bin in llama-server llama-cli llama-bench; do \
             ln -sf "/opt/llama-engram/$bin-engram" "/usr/local/bin/$bin-engram"; \
         done; \
-    else rmdir /opt/llama-engram; fi \
-    && if [ "${WITH_QWEN4EXP}" = "true" ]; then \
-        ln -sf /opt/llama-qwen4exp/llama-server-qwen4exp /usr/local/bin/llama-server-qwen4exp; \
-    else rmdir /opt/llama-qwen4exp; fi \
-    && if [ "${WITH_ROCM}" = "true" ] && [ "${WITH_QWEN4EXP}" = "true" ]; then \
-        ln -sf /opt/llama-qwen4exp-rocm/llama-server-qwen4exp-rocm /usr/local/bin/llama-server-qwen4exp-rocm; \
-    else rmdir /opt/llama-qwen4exp-rocm; fi
+    else rmdir /opt/llama-engram; fi
 
 # Example config with both backends; override by mounting /etc/llama-swap/config
 COPY config/config.yaml /etc/llama-swap/config/config.yaml
@@ -1122,14 +954,6 @@ if [ "${WITH_ROCM}" = "true" ] && [ "${WITH_ENGRAM}" = "true" ]; then
     BINS="$BINS llama-server-engram llama-cli-engram llama-bench-engram"
     SERVERS="$SERVERS llama-server-engram"
 fi
-if [ "${WITH_QWEN4EXP}" = "true" ]; then
-    BINS="$BINS llama-server-qwen4exp"
-    SERVERS="$SERVERS llama-server-qwen4exp"
-fi
-if [ "${WITH_ROCM}" = "true" ] && [ "${WITH_QWEN4EXP}" = "true" ]; then
-    BINS="$BINS llama-server-qwen4exp-rocm"
-    SERVERS="$SERVERS llama-server-qwen4exp-rocm"
-fi
 for bin in $BINS; do
     out=$(ldd "$(readlink -f "$(command -v "$bin")")")
     if grep -q 'not found' <<<"$out"; then
@@ -1138,7 +962,7 @@ for bin in $BINS; do
         exit 1
     fi
 done
-for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*) $([ -d /opt/llama-engram ] && echo /opt/llama-engram/*.so*) $([ -d /opt/llama-qwen4exp ] && echo /opt/llama-qwen4exp/*.so*) $([ -d /opt/llama-qwen4exp-rocm ] && echo /opt/llama-qwen4exp-rocm/*.so*); do
+for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*) $([ -d /opt/llama-engram ] && echo /opt/llama-engram/*.so*); do
     if ldd "$lib" | grep -q 'not found'; then
         echo "FATAL: $lib has unresolved libraries:" >&2; ldd "$lib" | grep 'not found' >&2; exit 1; fi
 done
@@ -1155,14 +979,15 @@ ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr
 CHECK
 
 RUN { echo "with_rocm: ${WITH_ROCM}"; \
-      if [ "${WITH_ROCM}" = "true" ]; then echo "rocm: ${ROCM_VERSION}"; echo "amdgpu_targets: ${AMDGPU_TARGETS}"; fi; \
+      if [ "${WITH_ROCM}" = "true" ]; then \
+        if [ "${ROCM_CHANNEL}" = "classic" ]; then echo "rocm: ${ROCM_VERSION} (classic)"; \
+        else echo "rocm: $(dpkg-query -W -f '${Version}' "amdrocm-runtime${ROCM_SERIES}") (multiarch, series ${ROCM_SERIES})"; fi; \
+        echo "amdgpu_targets: ${AMDGPU_TARGETS}"; fi; \
       echo "vulkan_rebuild: llama.cpp whisper.cpp stable-diffusion.cpp (base binaries replaced)"; \
       echo "sd_server_webui: embedded ($(cut -d' ' -f2 /tmp/sd-frontend-version))"; rm -f /tmp/sd-frontend-version; \
       cat /opt/llama-vulkan/.build-info; \
       if [ "${WITH_ROCM}" = "true" ]; then cat /opt/llama-rocm/.build-info; fi; \
       if [ -d /opt/llama-engram ]; then cat /opt/llama-engram/.build-info; fi; \
-      if [ -d /opt/llama-qwen4exp ]; then cat /opt/llama-qwen4exp/.build-info; fi; \
-      if [ -d /opt/llama-qwen4exp-rocm ]; then cat /opt/llama-qwen4exp-rocm/.build-info; fi; \
       echo "cpu_variants: $(ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ')"; \
       echo "mesa_ppa: ${MESA_PPA:-none}"; \
       echo "qwen_chat_template: $(grep -o 'template_version = "[^"]*"' /etc/llama-swap/templates/qwen-fixed.jinja | head -1 | cut -d'"' -f2) (${QWEN_TEMPLATE_URL})"; \
