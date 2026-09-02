@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       rocm:
-        description: "Also build the ROCm stages and publish the full image as :rocm (hours of runner time)"
+        description: "Also build the ROCm stages and publish the full image as :rocm, as branch pushes do (hours of runner time)"
         type: boolean
         required: false
         default: false
@@ -39,8 +39,9 @@ concurrency:
 
 # Two published images from one Dockerfile (WITH_ROCM build arg):
 #   :latest  Vulkan only  -- every push / weekly schedule / manual run
-#   :rocm    Vulkan+ROCm  -- manual run with the "rocm" checkbox; the three HIP
-#            stages are fat multi-gfx builds that take hours on a runner.
+#   :rocm    Vulkan+ROCm  -- every branch push, or a manual run with the "rocm"
+#            checkbox; the HIP stages are fat multi-gfx builds that take hours
+#            on a runner.
 
 jobs:
   # Lint, and pin the base image + image name once so every job in this run
@@ -128,9 +129,11 @@ jobs:
           cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache-{1},mode=max', needs.prepare.outputs.image, matrix.target) || '' }}
 
   # The ROCm stages are fat HIP builds (8 gfx targets, all-quant flash
-  # attention): only on a manual run with the "rocm" checkbox.
+  # attention): on every branch push, or a manual run with the "rocm" checkbox.
   build-stages-rocm:
-    if: github.event_name == 'workflow_dispatch' && inputs.rocm
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.rocm)
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 350
@@ -268,9 +271,12 @@ jobs:
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache,mode=max
 
-  # Full Vulkan+ROCm image -> :rocm (+ rocm-<sha>), manual runs only.
+  # Full Vulkan+ROCm image -> :rocm (+ rocm-<sha>): every branch push, or a
+  # manual run with the "rocm" checkbox.
   build-rocm:
-    if: github.event_name == 'workflow_dispatch' && inputs.rocm
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.rocm)
     needs: [prepare, build-stages-vulkan, build-stages-rocm]
     runs-on: ubuntu-latest
     timeout-minutes: 350
