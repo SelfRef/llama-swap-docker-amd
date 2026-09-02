@@ -17,7 +17,7 @@
 | llama.cpp + open qwen4exp PRs (MTP for Qwen3.8-Flash-Next) | `llama-server-qwen4exp` (all tags, `WITH_QWEN4EXP`) | — (use `*-engram` on Strix Halo) |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | `whisper-server`, `whisper-cli` | `whisper-server-rocm`, `whisper-cli-rocm` |
 | [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | `sd-server` (web UI embedded), `sd-cli` | `sd-server-rocm` (web UI embedded), `sd-cli-rocm` |
-| [audio.cpp](https://github.com/0xShug0/audio.cpp) | `audiocpp_server`, `audiocpp_cli` (from base image) | — (no HIP backend upstream) |
+| [audio.cpp](https://github.com/0xShug0/audio.cpp) | `audiocpp_server`, `audiocpp_cli` (from base image); `audiocpp_gguf` (GGUF converter, built here, CPU-only, all tags) | — (no HIP backend upstream) |
 | llama-swap + [vllm-wrapper](https://github.com/mostlygeek/llama-swap/tree/main/cmd/vllm-wrapper) | `llama-swap`, `vllm-wrapper` (backend-independent, from base image) | |
 
 llama.cpp lives in self-contained directories `/opt/llama-vulkan`, `/opt/llama-rocm` and `/opt/llama-engram` (binaries, `libllama`/`libggml*` and the per-CPU-level `libggml-cpu-*.so` variants, RPATH `$ORIGIN`) with symlinks in `/usr/local/bin`; whisper/sd binaries are static. `ik-llama-server` from the CUDA image is not included (upstream builds it CUDA-only). Exact versions of everything — including the glslc used and the enabled build options — are recorded in `/versions.txt` inside the image.
@@ -58,7 +58,7 @@ Build args:
 | `ROCM_VERSION` | `7.2.4` | classic channel: builder image tag and apt repo path |
 | `AMDGPU_TARGETS` | `gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201` | gfx architectures compiled into the HIP binaries (RDNA2/3/3.5/4). CDNA (`gfx908;gfx90a;gfx942`) is not included by default — add it if you run Instinct cards. Trim to just your GPU for a much faster build. |
 | `LLAMA_COMMIT` | `master` | llama.cpp revision for both the Vulkan and the ROCm build (sha, tag, branch, or `refs/pull/N/head`). `""` = the base image's commit from `/versions.txt`. Defaults to master so the PRs in `LLAMA_PATCHES` apply and the newest backend work is in. |
-| `WHISPER_COMMIT` / `SD_COMMIT` | *(empty)* | Override the project revision; empty means "same commit as the base image" |
+| `WHISPER_COMMIT` / `SD_COMMIT` / `AUDIOCPP_COMMIT` | *(empty)* | Override the project revision; empty means "same commit as the base image" (`AUDIOCPP_COMMIT` only affects the `audiocpp_gguf` converter — the audio.cpp server/CLI are the base image's) |
 | `GLSLC_SUITE` | `resolute` | Ubuntu release whose `glslc`/`libshaderc1` are used by the Vulkan builder (only those two packages; everything else stays 24.04) |
 | `LLAMA_FA_ALL_QUANTS` | `ON` | ROCm llama.cpp: compile flash-attention kernels for all K/V cache quant combinations (without it only q8_0/q8_0 and q4_0/q4_0 stay on the GPU, see llama.cpp #27761). Set `OFF` for a faster build. |
 | `WITH_ENGRAM` | `true` | Build [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp) as `*-engram` binaries. Only takes effect together with `WITH_ROCM=true` (the fork is HIP-only), so `:latest` never contains it. `false` skips the stage. |
@@ -167,7 +167,16 @@ docker run --rm --entrypoint cat ghcr.io/selfref/llama-swap-docker-amd:latest /v
 
 - The image is large (~13–15 GB): the ROCm runtime with rocBLAS/hipBLASLt kernel libraries accounts for most of it.
 - `sd-server` (both backends) serves its web UI at `/` — upstream builds it without the frontend (no `pnpm` in its builder), so there `/` is a text placeholder and you need `--serve-html-path`. Here the pinned `sdcpp-webui` is built once (Node stage) and embedded; `/versions.txt` lists its commit as `sd_server_webui:`.
-- The Vulkan engines are NOT the base image's binaries (see above); `audiocpp_server`, `llama-swap` and `vllm-wrapper` are. The base image's shared `libggml*.so`/`libwhisper*.so` in `/usr/local/lib` are removed (nothing uses them any more).
+- The Vulkan engines are NOT the base image's binaries (see above); `audiocpp_server`, `audiocpp_cli`, `llama-swap` and `vllm-wrapper` are. The base image's shared `libggml*.so`/`libwhisper*.so` in `/usr/local/lib` are removed (nothing uses them any more).
+- `audiocpp_gguf` is audio.cpp's GGUF converter, which the base image does not ship. It is built here (CPU-only, static, at the base image's audio.cpp commit so its model-spec catalog matches `audiocpp_server`; `/versions.txt` lists it as `audiocpp_gguf_commit:`) for the community models whose licence forbids redistributing converted weights — e.g. [audio8_asr](https://github.com/0xShug0/audio.cpp/blob/main/docs/community_models/audio8_asr.md) (Audio8-ASR-0.1B, CC-BY-NC-4.0) is absent from `audio-cpp/audio.cpp-gguf` and has to be converted from the HF checkpoint you download yourself:
+
+  ```sh
+  hf download Audio8/Audio8-ASR-0.1B --local-dir /models/Audio8-ASR-0.1B-hf
+  audiocpp_gguf --input /models/Audio8-ASR-0.1B-hf/model.safetensors --root /models/Audio8-ASR-0.1B-hf \
+      --family audio8_asr --type q8_0 --output /models/Audio8-ASR-0.1B-GGUF/audio8-asr-0.1b-q8_0.gguf
+  ```
+
+  The output is self-contained (tokenizer/config sidecars and the model spec are embedded); point the `path` of an `audio8_asr` entry in your audio.cpp server config at the `.gguf` file.
 - The container runs as root (standard for ROCm images — device access works without any `--group-add`). Files created in `/models` will be root-owned on the host. If you run as a non-root user, pass the *numeric* host GIDs of your `video`/`render` groups (`--group-add $(getent group render | cut -d: -f3)`); the image has no `render` group, so adding it by name fails.
 - Verified on a Ryzen AI MAX+ 395 / Radeon 8060S (Strix Halo, gfx1151): both `llama-server --list-devices` (Vulkan/RADV) and `llama-server-rocm --list-devices` (ROCm) see the GPU. A gfx1100-only build also works on it with `HSA_OVERRIDE_GFX_VERSION=11.0.0`.
 - The base image is rebuilt daily by upstream; this image is rebuilt weekly by CI, so `latest` here can lag `unified-vulkan` by a few days. Trigger the workflow manually to sync sooner.

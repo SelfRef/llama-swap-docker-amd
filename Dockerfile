@@ -38,13 +38,18 @@
 #     kernels for every K/V cache type combination; without it only q8_0/q8_0
 #     and q4_0/q4_0 stay on the GPU and e.g. q8_0/q4_0 falls back to the CPU
 #     (upstream issue #27761: pp512 drops ~68%).
+#   - audio.cpp's GGUF converter (audiocpp_gguf, CPU-only) at the base image's
+#     audio.cpp commit -- the base ships the server and CLI but no converter,
+#     and some community models (audio8_asr, CC-BY-NC) exist only as HF
+#     checkpoints that must be converted locally.
 #
 # whisper.cpp and sd.cpp are pinned to the commits recorded in the base
 # image's /versions.txt. llama.cpp is built from LLAMA_COMMIT (default: current
 # master) plus the upstream PRs in LLAMA_PATCHES, identically for Vulkan and
 # ROCm, so both backends are always the same revision; the built commit is
 # recorded in /versions.txt. audio.cpp has no HIP backend upstream and is left
-# as shipped by the base image (Vulkan, its own ggml fork).
+# as shipped by the base image (Vulkan, its own ggml fork); only its converter
+# is built here, at that same commit (see audiocpp-tools).
 #
 # Layout: llama.cpp is installed as self-contained directories
 # /opt/llama-vulkan and /opt/llama-rocm (binaries + their shared libs, RPATH
@@ -573,6 +578,62 @@ for bin in sd-server sd-cli; do
 done
 BUILD
 
+# ── audio.cpp tools: audiocpp_gguf (GGUF converter, CPU) ───────────────
+# audio.cpp itself stays as shipped by the base image (audiocpp_server,
+# audiocpp_cli), but the base has no converter. audiocpp_gguf turns a HF
+# safetensors checkpoint into an audio.cpp GGUF package: weights + embedded
+# tokenizer/config sidecars + the family's model spec from the converter's
+# compiled-in catalog (no --model-spec needed). Required for community models
+# whose licence forbids redistributing converted weights (audio8_asr,
+# CC-BY-NC-4.0) and which are therefore absent from audio-cpp/audio.cpp-gguf:
+#   audiocpp_gguf --input <ckpt>/model.safetensors --root <ckpt> \
+#       --family audio8_asr --type q8_0 --output <out>/audio8-asr-0.1b-q8_0.gguf
+# Built at the base image's audio.cpp commit so the catalog matches the
+# audiocpp_server that loads the output. CPU-only (the converter never touches
+# a GPU), no -march=native (CI runners are not the target CPU), and it links
+# engine_runtime + ggml statically (only libc/libstdc++/libgomp at runtime).
+# Source via GitHub's tarball endpoint rather than git: a pinned sha with no
+# PRs to merge, and GitHub answers anonymous git-over-HTTPS with 401 ("could
+# not read Username") from rate-limited IPs while codeload keeps working.
+
+FROM vulkan-builder AS audiocpp-tools
+ARG AUDIOCPP_COMMIT=""
+RUN --mount=type=cache,id=ccache-vulkan,target=/ccache <<'BUILD'
+#!/bin/bash
+set -euo pipefail
+
+COMMIT="${AUDIOCPP_COMMIT:-$(awk '$1=="audio.cpp:"{print $2}' /build/versions.txt)}"
+[ -n "$COMMIT" ] || { echo "FATAL: no audio.cpp commit in versions.txt and no AUDIOCPP_COMMIT given" >&2; exit 1; }
+
+echo "=== Fetching audio.cpp at ${COMMIT} ==="
+mkdir -p /src/audio.cpp && cd /src/audio.cpp
+curl -fsSL --retry 5 --retry-all-errors \
+    "https://codeload.github.com/0xShug0/audio.cpp/tar.gz/${COMMIT}" \
+    | tar -xz --strip-components=1
+[ -f CMakeLists.txt ] || { echo "FATAL: audio.cpp tarball for ${COMMIT} is empty" >&2; exit 1; }
+
+echo "=== Building audiocpp_gguf (CPU) ==="
+cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DENGINE_ENABLE_VULKAN=OFF -DENGINE_ENABLE_CUDA=OFF -DENGINE_ENABLE_HIP=OFF \
+    -DENGINE_ENABLE_NATIVE_CPU=OFF \
+    -DENGINE_BUILD_EXAMPLES=OFF -DENGINE_BUILD_TESTS=OFF -DENGINE_BUILD_MODEL_TESTS=OFF \
+    -DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=OFF
+cmake --build build --config Release -j"$(nproc)" --target audiocpp_gguf
+
+mkdir -p /install/bin
+bin=$(find build -name audiocpp_gguf -type f -perm -u+x | head -1)
+[ -n "$bin" ] || { echo "FATAL: audiocpp_gguf not built" >&2; exit 1; }
+if readelf -d "$bin" | grep -q 'libggml\|libengine'; then
+    echo "FATAL: audiocpp_gguf is not statically linked against ggml/engine_runtime" >&2; exit 1; fi
+cp "$bin" /install/bin/
+# Usage exits non-zero; the point is that the binary loads and runs.
+{ /install/bin/audiocpp_gguf 2>&1 || true; } | grep -q '^Usage: audiocpp_gguf' || { echo "FATAL: audiocpp_gguf does not run" >&2; exit 1; }
+echo "audiocpp_gguf_commit: ${COMMIT} (requested: ${AUDIOCPP_COMMIT:-base image})" > /install/audiocpp-tools.build-info
+BUILD
+
 # ── ROCm toolchain (selected by ROCM_CHANNEL, see the arg) ─────────────
 
 # classic: AMD's prebuilt dev image; the build scripts derive HIPCXX/HIP_PATH
@@ -1043,6 +1104,8 @@ COPY --from=llama-vulkan   /install/llama-vulkan/ /opt/llama-vulkan/
 COPY --from=whisper-vulkan /install/bin/ /usr/local/bin/
 COPY --from=sd-vulkan      /install/bin/ /usr/local/bin/
 COPY --from=sd-vulkan      /install/sd-frontend-version /tmp/sd-frontend-version
+COPY --from=audiocpp-tools /install/bin/ /usr/local/bin/
+COPY --from=audiocpp-tools /install/audiocpp-tools.build-info /tmp/audiocpp-tools.build-info
 COPY --from=llama-rocm-sel   /install/llama-rocm/ /opt/llama-rocm/
 COPY --from=whisper-rocm-sel /install/bin/ /usr/local/bin/
 COPY --from=sd-rocm-sel      /install/bin/ /usr/local/bin/
@@ -1091,7 +1154,7 @@ RUN chmod 755 /etc/llama-swap/templates
 RUN <<'CHECK'
 #!/bin/bash
 set -euo pipefail
-BINS="llama-server llama-cli llama-tts llama-bench whisper-server whisper-cli sd-server sd-cli audiocpp_server"
+BINS="llama-server llama-cli llama-tts llama-bench whisper-server whisper-cli sd-server sd-cli audiocpp_server audiocpp_gguf"
 SERVERS="llama-server"
 if [ "${WITH_ROCM}" = "true" ]; then
     BINS="$BINS llama-server-rocm llama-cli-rocm llama-tts-rocm llama-bench-rocm whisper-server-rocm whisper-cli-rocm sd-server-rocm sd-cli-rocm"
@@ -1136,6 +1199,7 @@ RUN { echo "with_rocm: ${WITH_ROCM}"; \
         echo "amdgpu_targets: ${AMDGPU_TARGETS}"; fi; \
       echo "vulkan_rebuild: llama.cpp whisper.cpp stable-diffusion.cpp (base binaries replaced)"; \
       echo "sd_server_webui: embedded ($(cut -d' ' -f2 /tmp/sd-frontend-version))"; rm -f /tmp/sd-frontend-version; \
+      cat /tmp/audiocpp-tools.build-info; rm -f /tmp/audiocpp-tools.build-info; \
       cat /opt/llama-vulkan/.build-info; \
       if [ "${WITH_ROCM}" = "true" ]; then cat /opt/llama-rocm/.build-info; fi; \
       if [ -d /opt/llama-engram ]; then cat /opt/llama-engram/.build-info; fi; \

@@ -84,7 +84,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [llama-vulkan, llama-qwen4exp, whisper-vulkan, sd-vulkan]
+        target: [llama-vulkan, llama-qwen4exp, whisper-vulkan, sd-vulkan, audiocpp-tools]
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -249,6 +249,7 @@ jobs:
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-qwen4exp
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp-tools
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache,mode=max
       - name: Build and push (Vulkan only, retry)
@@ -270,6 +271,7 @@ jobs:
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-qwen4exp
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp-tools
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache,mode=max
 
@@ -336,6 +338,7 @@ jobs:
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-qwen4exp
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp-tools
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-rocm
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-engram
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-rocm
@@ -361,6 +364,7 @@ jobs:
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-qwen4exp
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp-tools
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-rocm
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-engram
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-rocm
