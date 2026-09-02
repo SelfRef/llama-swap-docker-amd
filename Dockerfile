@@ -150,6 +150,32 @@ ARG LLAMA_COMMIT="master"
 # (stale, conflicts with master).
 ARG LLAMA_PATCHES="27952"
 
+# llama-server-qwen4exp: an EXTRA llama-server for Qwen3.8-Flash-Next (arch
+# qwen4exp), restored 2026-09-02 (the 2026-09-01 removal was premature: the
+# #27742/#27941/#28040/#28123/#28023/#28121 set did merge upstream, but MTP
+# itself did NOT — #28104 was withdrawn by its author on 2026-09-01, and the
+# competing implementation #27836 + the unsloth-sidecar loader #28097 are
+# still open). Vulkan-only (the ROCm/Strix Halo side is covered by
+# EngramHalo above). Built from QWEN4EXP_COMMIT plus:
+#   #27836 MTP draft head graph (--spec-type draft-mtp for qwen4exp)
+#   #28136 direct pread()s for the lazy PLE/n-gram table — without it the
+#          mmap fault path collapses prefill (measured 35 vs ~260 t/s on the
+#          RX 7900 XTX with the table on NVMe)
+#   #28213 gather-based sparse attention for QSA decode (+50% tg @130k
+#          upstream claim, 2x A6000)
+#   #27952 vulkan int8 coopmat1 (same as LLAMA_PATCHES)
+# plus patches/qwen4exp-28097-rebased.patch: upstream #28097 (draft-head-only
+# sidecar GGUFs, unsloth MTP/ layout incl. the "shared" embedding-borrowing
+# variants) rebased onto the merged tree — the PR itself conflicts with
+# master's newer PLE row-count logic (resolution: keep master's body, add the
+# !mtp_only guards). Regenerate when it drifts: merge the PR by hand and
+# `git diff HEAD^1 HEAD`. Same drift rules as LLAMA_PATCHES: closed PRs are
+# skipped, conflicts FAIL the build. Retire the stage for real once #27836 +
+# #28097 land upstream.
+ARG WITH_QWEN4EXP=true
+ARG QWEN4EXP_COMMIT="master"
+ARG QWEN4EXP_PATCHES="27952 27836 28136 28213"
+
 # Sources of the fixed Qwen chat templates shipped under
 # /etc/llama-swap/templates/ (fetched at build time):
 #   qwen-fixed.jinja -- froggeric's Qwen-Fixed-Chat-Templates (the base fix)
@@ -320,6 +346,117 @@ echo "llama_patches: ${LLAMA_PATCHES:-none}" >> "$OUT/.build-info"
 BUILD
 
 # ── Build whisper.cpp (Vulkan) ─────────────────────────────────────────
+
+# ── Build llama.cpp (Vulkan) + open qwen4exp PRs → llama-server-qwen4exp ─
+# See the WITH_QWEN4EXP ARG block for the PR set and rationale.
+
+FROM vulkan-builder AS llama-qwen4exp
+ARG QWEN4EXP_COMMIT
+ARG QWEN4EXP_PATCHES
+COPY patches/ /build/qwen4exp-patches/
+RUN --mount=type=cache,id=ccache-vulkan,target=/ccache <<'BUILD'
+#!/bin/bash
+set -euo pipefail
+
+COMMIT="${QWEN4EXP_COMMIT:-master}"
+
+echo "=== Cloning llama.cpp at ${COMMIT} ==="
+mkdir -p /src/llama.cpp && cd /src/llama.cpp
+git init -q
+git remote add origin https://github.com/ggml-org/llama.cpp.git
+git fetch --filter=blob:none origin "${COMMIT}"
+git checkout -q FETCH_HEAD
+echo "llama.cpp at $(git rev-parse HEAD)"
+
+# Same PR-merge rules as the llama-vulkan stage: closed PRs are skipped (a
+# merged one is already in master), a conflicting merge FAILS the build.
+MERGED_PRS=""
+for pr in ${QWEN4EXP_PATCHES:-}; do
+    echo "=== Merging upstream PR #${pr} ==="
+    if ! git ls-remote --exit-code origin "refs/pull/${pr}/merge" >/dev/null 2>&1; then
+        echo "PR #${pr} is closed on GitHub (merged or rejected) -- skipping; remove it from QWEN4EXP_PATCHES"
+        continue
+    fi
+    git fetch --filter=blob:none origin "refs/pull/${pr}/head"
+    if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+        echo "PR #${pr} is already contained in ${COMMIT} -- skipping"
+        continue
+    fi
+    git -c user.name=llama-swap-amd -c user.email=build@localhost \
+        merge --no-edit --no-ff -m "merge upstream PR #${pr}" FETCH_HEAD \
+        || { echo "FATAL: PR #${pr} does not merge cleanly into ${COMMIT} -- it has drifted, re-check it" >&2; exit 1; }
+    MERGED_PRS="${MERGED_PRS} ${pr}"
+done
+
+# Local patches on top (currently: #28097 rebased, see the ARG block).
+# Reverse-applying = already upstream: skip.
+for p in /build/qwen4exp-patches/*.patch; do
+    [ -e "$p" ] || continue
+    if git apply --check "$p" 2>/dev/null; then
+        git apply "$p"; echo "applied local patch: $(basename "$p")"
+    elif git apply --reverse --check "$p" 2>/dev/null; then
+        echo "local patch already upstream: $(basename "$p")"
+    else
+        echo "FATAL: local patch $(basename "$p") no longer applies -- rebase it against the merged tree" >&2
+        exit 1
+    fi
+done
+
+echo "=== glslc feature tests (llama.cpp's own) ==="
+for t in integer_dot bfloat16 coopmat; do
+    f="ggml/src/ggml-vulkan/vulkan-shaders/feature-tests/$t.comp"
+    [ -f "$f" ] || { echo "(no feature test $t in this revision, skipping)"; continue; }
+    if glslc -o /dev/null -fshader-stage=compute --target-env=vulkan1.3 "$f" >/dev/null 2>&1; then
+        echo "  $t: OK"
+    else
+        echo "FATAL: glslc cannot compile $f -- the Vulkan rebuild would lose that code path" >&2
+        exit 1
+    fi
+done
+
+echo "=== Building llama.cpp (Vulkan, qwen4exp) ==="
+cmake -B build \
+    -DGGML_NATIVE=OFF \
+    -DGGML_VULKAN=ON \
+    -DBUILD_SHARED_LIBS=ON \
+    -DGGML_BACKEND_DL=ON \
+    -DGGML_CPU_ALL_VARIANTS=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+    -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+    2>&1 | tee /tmp/configure.log
+for ext in GL_EXT_integer_dot_product GL_EXT_bfloat16 GL_KHR_cooperative_matrix; do
+    line=$(grep -i "$ext" /tmp/configure.log || true)
+    echo "  cmake: ${line:-<no message for $ext>}"
+    if grep -qi "not supported" <<<"$line"; then
+        echo "FATAL: CMake reports $ext unsupported by glslc" >&2; exit 1; fi
+done
+cmake --build build --config Release -j"$(nproc)"
+
+echo "=== Collecting ==="
+OUT=/install/llama-qwen4exp
+mkdir -p "$OUT"
+[ -f build/bin/llama-server ] || { echo "FATAL: llama-server not built" >&2; exit 1; }
+cp build/bin/llama-server "$OUT/llama-server-qwen4exp"
+cp -P build/bin/*.so* "$OUT/"
+ls "$OUT"/libggml-cpu-*.so >/dev/null 2>&1 || { echo "FATAL: no ggml-cpu variants built" >&2; exit 1; }
+ls "$OUT"/libggml-vulkan.so >/dev/null 2>&1 || { echo "FATAL: libggml-vulkan.so not built" >&2; exit 1; }
+for f in "$OUT"/*; do
+    [ -L "$f" ] && continue
+    rp=$(readelf -d "$f" 2>/dev/null | awk '/RUNPATH|RPATH/ {gsub(/[\[\]]/,"",$NF); print $NF}')
+    if [ -n "$rp" ] && { [[ "$rp" != '$ORIGIN'* ]] || [[ "$rp" == */src/* ]]; }; then
+        echo "FATAL: $f has run path '$rp' (expected \$ORIGIN[:...])" >&2; exit 1; fi
+    if ldd "$f" 2>/dev/null | grep -q "not found"; then
+        echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
+done
+{ echo "llama_qwen4exp_commit: $(git rev-parse HEAD) (requested: ${COMMIT})";
+  echo "llama_qwen4exp_prs:${MERGED_PRS:- none}";
+  echo "llama_qwen4exp_local_patches: $(ls /build/qwen4exp-patches/*.patch 2>/dev/null | xargs -rn1 basename | tr '\n' ' ')"; } > "$OUT/.build-info"
+BUILD
 
 FROM vulkan-builder AS whisper-vulkan
 ARG WHISPER_COMMIT=""
@@ -791,7 +928,7 @@ BUILD
 # HIP builders are never started.
 
 FROM alpine:3 AS rocm-none
-RUN mkdir -p /install/bin /install/llama-rocm /install/llama-engram
+RUN mkdir -p /install/bin /install/llama-rocm /install/llama-engram /install/llama-qwen4exp
 
 FROM llama-rocm   AS llama-rocm-true
 FROM whisper-rocm AS whisper-rocm-true
@@ -812,6 +949,11 @@ FROM rocm-none    AS llama-engram-false-true
 FROM rocm-none    AS llama-engram-false-false
 FROM llama-engram-${WITH_ROCM}-${WITH_ENGRAM} AS llama-engram-sel
 
+# qwen4exp is a Vulkan build — selected by its own switch, in every tag.
+FROM llama-qwen4exp AS llama-qwen4exp-true
+FROM rocm-none      AS llama-qwen4exp-false
+FROM llama-qwen4exp-${WITH_QWEN4EXP} AS llama-qwen4exp-sel
+
 # ── Final image: base (+ ROCm runtime) + rebuilt binaries ──────────────
 
 FROM vulkan-base AS final
@@ -825,6 +967,7 @@ ARG QWEN_TEMPLATE_URL
 ARG QWEN_SHARP_TEMPLATE_URL
 ARG WITH_ROCM
 ARG WITH_ENGRAM
+ARG WITH_QWEN4EXP
 
 LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-docker-amd" \
       org.opencontainers.image.description="llama-swap unified image for AMD GPUs (ROCm + Vulkan)"
@@ -904,6 +1047,7 @@ COPY --from=llama-rocm-sel   /install/llama-rocm/ /opt/llama-rocm/
 COPY --from=whisper-rocm-sel /install/bin/ /usr/local/bin/
 COPY --from=sd-rocm-sel      /install/bin/ /usr/local/bin/
 COPY --from=llama-engram-sel /install/llama-engram/ /opt/llama-engram/
+COPY --from=llama-qwen4exp-sel /install/llama-qwen4exp/ /opt/llama-qwen4exp/
 RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
         ln -sf "/opt/llama-vulkan/$bin" "/usr/local/bin/$bin"; \
         if [ "${WITH_ROCM}" = "true" ]; then \
@@ -915,7 +1059,10 @@ RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
         for bin in llama-server llama-cli llama-bench; do \
             ln -sf "/opt/llama-engram/$bin-engram" "/usr/local/bin/$bin-engram"; \
         done; \
-    else rmdir /opt/llama-engram; fi
+    else rmdir /opt/llama-engram; fi \
+    && if [ "${WITH_QWEN4EXP}" = "true" ]; then \
+        ln -sf /opt/llama-qwen4exp/llama-server-qwen4exp /usr/local/bin/llama-server-qwen4exp; \
+    else rmdir /opt/llama-qwen4exp; fi
 
 # Example config with both backends; override by mounting /etc/llama-swap/config
 COPY config/config.yaml /etc/llama-swap/config/config.yaml
@@ -954,6 +1101,10 @@ if [ "${WITH_ROCM}" = "true" ] && [ "${WITH_ENGRAM}" = "true" ]; then
     BINS="$BINS llama-server-engram llama-cli-engram llama-bench-engram"
     SERVERS="$SERVERS llama-server-engram"
 fi
+if [ "${WITH_QWEN4EXP}" = "true" ]; then
+    BINS="$BINS llama-server-qwen4exp"
+    SERVERS="$SERVERS llama-server-qwen4exp"
+fi
 for bin in $BINS; do
     out=$(ldd "$(readlink -f "$(command -v "$bin")")")
     if grep -q 'not found' <<<"$out"; then
@@ -962,7 +1113,7 @@ for bin in $BINS; do
         exit 1
     fi
 done
-for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*) $([ -d /opt/llama-engram ] && echo /opt/llama-engram/*.so*); do
+for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*) $([ -d /opt/llama-engram ] && echo /opt/llama-engram/*.so*) $([ -d /opt/llama-qwen4exp ] && echo /opt/llama-qwen4exp/*.so*); do
     if ldd "$lib" | grep -q 'not found'; then
         echo "FATAL: $lib has unresolved libraries:" >&2; ldd "$lib" | grep 'not found' >&2; exit 1; fi
 done
@@ -988,6 +1139,7 @@ RUN { echo "with_rocm: ${WITH_ROCM}"; \
       cat /opt/llama-vulkan/.build-info; \
       if [ "${WITH_ROCM}" = "true" ]; then cat /opt/llama-rocm/.build-info; fi; \
       if [ -d /opt/llama-engram ]; then cat /opt/llama-engram/.build-info; fi; \
+      if [ -d /opt/llama-qwen4exp ]; then cat /opt/llama-qwen4exp/.build-info; fi; \
       echo "cpu_variants: $(ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ')"; \
       echo "mesa_ppa: ${MESA_PPA:-none}"; \
       echo "qwen_chat_template: $(grep -o 'template_version = "[^"]*"' /etc/llama-swap/templates/qwen-fixed.jinja | head -1 | cut -d'"' -f2) (${QWEN_TEMPLATE_URL})"; \

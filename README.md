@@ -14,6 +14,7 @@
 |---|---|---|
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `llama-server`, `llama-cli`, `llama-tts`, `llama-bench` | `llama-server-rocm`, `llama-cli-rocm`, `llama-tts-rocm`, `llama-bench-rocm` |
 | [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp) (llama.cpp fork, Strix Halo/qwen4exp) | — (fork is ROCm/HIP-only) | `llama-server-engram`, `llama-cli-engram`, `llama-bench-engram` (gfx1151 only) |
+| llama.cpp + open qwen4exp PRs (MTP for Qwen3.8-Flash-Next) | `llama-server-qwen4exp` (all tags, `WITH_QWEN4EXP`) | — (use `*-engram` on Strix Halo) |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | `whisper-server`, `whisper-cli` | `whisper-server-rocm`, `whisper-cli-rocm` |
 | [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | `sd-server` (web UI embedded), `sd-cli` | `sd-server-rocm` (web UI embedded), `sd-cli-rocm` |
 | [audio.cpp](https://github.com/0xShug0/audio.cpp) | `audiocpp_server`, `audiocpp_cli` (from base image) | — (no HIP backend upstream) |
@@ -63,6 +64,8 @@ Build args:
 | `WITH_ENGRAM` | `true` | Build [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp) as `*-engram` binaries. Only takes effect together with `WITH_ROCM=true` (the fork is HIP-only), so `:latest` never contains it. `false` skips the stage. |
 | `ENGRAM_REPO` / `ENGRAM_BRANCH` | Aristo94's repo, `strix-halo-qwen4exp` | Fork source. The branch rebases onto llama.cpp master and carries the Strix Halo patch series. |
 | `ENGRAM_TARGETS` | `gfx1151` | gfx targets for the EngramHalo build. gfx1151 alone on purpose: the fork's kernels are tuned for and only validated on Strix Halo. |
+| `WITH_QWEN4EXP` | `true` | Build `llama-server-qwen4exp` (Vulkan): master + the still-open qwen4exp PRs — #27836 MTP draft head, #28097 (rebased local patch) unsloth sidecar loading, #28136 PLE direct reads (`--lazy-mode on-direct`), #28213 QSA gather decode, #27952 int8 coopmat. Restored 2026-09-02: the merged Sep 1 upstream set (#27941/#28040/#28123/#28023/#28121) did NOT include MTP (#28104 was withdrawn). Retire once #27836+#28097 merge. |
+| `QWEN4EXP_COMMIT` / `QWEN4EXP_PATCHES` | `master` / `27952 27836 28136 28213` | Revision + PR set for that build; same drift rules as `LLAMA_PATCHES`. `patches/*.patch` apply on top (currently the rebased #28097 and the #28136 merge fix) and fail the build loudly when they stop applying. |
 | `MESA_PPA` | `ppa:kisak/kisak-mesa` | Newer Mesa/RADV for the final image; `""` keeps the base image's stock Mesa 25.2 |
 | `QWEN_TEMPLATE_URL` | froggeric's `chat_template.jinja` | Source of the fixed Qwen chat template shipped at `/etc/llama-swap/templates/qwen-fixed.jinja` (see below) |
 | `QWEN_SHARP_TEMPLATE_URL` | peculiar-ragdoll's `chat_template.jinja` | Source of the Sharp variant shipped at `/etc/llama-swap/templates/qwen-sharp.jinja` (see below) |
