@@ -162,24 +162,39 @@ ARG LLAMA_PATCHES="27952"
 # competing implementation #27836 + the unsloth-sidecar loader #28097 are
 # still open). Vulkan-only (the ROCm/Strix Halo side is covered by
 # EngramHalo above). Built from QWEN4EXP_COMMIT plus:
-#   #27836 MTP draft head graph (--spec-type draft-mtp for qwen4exp)
 #   #28136 direct pread()s for the lazy PLE/n-gram table — without it the
 #          mmap fault path collapses prefill (measured 35 vs ~260 t/s on the
 #          RX 7900 XTX with the table on NVMe)
 #   #28213 gather-based sparse attention for QSA decode (+50% tg @130k
 #          upstream claim, 2x A6000)
+#   #28330 stop llama_memory_hybrid_idx from allocating a V cache for the
+#          lightning indexer (unused; upstream issue #28296) — pure memory
+#          win, added 2026-09-04
 #   #27952 vulkan int8 coopmat1 (same as LLAMA_PATCHES)
-# plus patches/qwen4exp-28097-rebased.patch: upstream #28097 (draft-head-only
-# sidecar GGUFs, unsloth MTP/ layout incl. the "shared" embedding-borrowing
-# variants) rebased onto the merged tree — the PR itself conflicts with
-# master's newer PLE row-count logic (resolution: keep master's body, add the
-# !mtp_only guards). Regenerate when it drifts: merge the PR by hand and
-# `git diff HEAD^1 HEAD`. Same drift rules as LLAMA_PATCHES: closed PRs are
-# skipped, conflicts FAIL the build. Retire the stage for real once #27836 +
-# #28097 land upstream.
+# plus the local patches in patches/, applied after the merges (glob order):
+#   qwen4exp-27836-rebased.patch: upstream #27836 (MTP draft head graph,
+#     --spec-type draft-mtp) — a plain merge STOPPED WORKING on 2026-09-04:
+#     master turned n_ff_exp into the per-layer n_ff_exp_arr/n_ff_exp(il)
+#     pair while the PR still reads the scalar, so src/models/qwen4exp.cpp
+#     conflicts twice (resolution: keep master's array read + n_ff_exp(il),
+#     keep the PR's NEXTN_PREDICT_LAYERS read and its `flags` line).
+#   qwen4exp-28097-rebased.patch: upstream #28097 (draft-head-only sidecar
+#     GGUFs, unsloth MTP/ layout incl. the "shared" embedding-borrowing
+#     variants) rebased onto the merged tree — the PR itself conflicts with
+#     master's newer PLE row-count logic (resolution: keep master's body, add
+#     the !mtp_only guards).
+# Regenerate a rebased patch when it drifts: merge its PR by hand on top of
+# the other merges and `git diff <merges-without-it> HEAD`. Same drift rules
+# as LLAMA_PATCHES: closed PRs are skipped, conflicts FAIL the build. Retire
+# the stage for real once #27836 + #28097 land upstream.
+# Retired 2026-09-04: qwen4exp-28136-merge-fix.patch — #28136 was rewritten
+# upstream (the direct-read setup now lives in llama_model_base::
+# load_lazy_reader, which nil-checks the weight itself), so the old semantic
+# merge fix is obsolete. Its log line moved too: "direct reads enabled for
+# <tensor>", no longer "PLE direct read enabled".
 ARG WITH_QWEN4EXP=true
 ARG QWEN4EXP_COMMIT="master"
-ARG QWEN4EXP_PATCHES="27952 27836 28136 28213"
+ARG QWEN4EXP_PATCHES="27952 28136 28213 28330"
 
 # Sources of the fixed Qwen chat templates shipped under
 # /etc/llama-swap/templates/ (fetched at build time):
