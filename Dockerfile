@@ -155,48 +155,50 @@ ARG LLAMA_COMMIT="master"
 # (stale, conflicts with master).
 ARG LLAMA_PATCHES="27952"
 
-# llama-server-qwen4exp (+ llama-bench-qwen4exp, added 2026-09-05 so the
-# patched build can be A/B-ed kernel-level like every other variant): an EXTRA
-# llama-server for Qwen3.8-Flash-Next (arch qwen4exp), restored 2026-09-02
-# (the 2026-09-01 removal was premature: the
-# #27742/#27941/#28040/#28123/#28023/#28121 set did merge upstream, but MTP
-# itself did NOT — #28104 was withdrawn by its author on 2026-09-01, and the
-# competing implementation #27836 + the unsloth-sidecar loader #28097 are
-# still open). Vulkan-only (the ROCm/Strix Halo side is covered by
-# EngramHalo above). Built from QWEN4EXP_COMMIT plus:
-#   #28136 direct pread()s for the lazy PLE/n-gram table — without it the
-#          mmap fault path collapses prefill (measured 35 vs ~260 t/s on the
-#          RX 7900 XTX with the table on NVMe)
-#   #28213 gather-based sparse attention for QSA decode (+50% tg @130k
-#          upstream claim, 2x A6000)
-#   #28330 stop llama_memory_hybrid_idx from allocating a V cache for the
-#          lightning indexer (unused; upstream issue #28296) — pure memory
-#          win, added 2026-09-04
-#   #27952 vulkan int8 coopmat1 (same as LLAMA_PATCHES)
-# plus the local patches in patches/, applied after the merges (glob order):
-#   qwen4exp-27836-rebased.patch: upstream #27836 (MTP draft head graph,
-#     --spec-type draft-mtp) — a plain merge STOPPED WORKING on 2026-09-04:
-#     master turned n_ff_exp into the per-layer n_ff_exp_arr/n_ff_exp(il)
-#     pair while the PR still reads the scalar, so src/models/qwen4exp.cpp
-#     conflicts twice (resolution: keep master's array read + n_ff_exp(il),
-#     keep the PR's NEXTN_PREDICT_LAYERS read and its `flags` line).
-#   qwen4exp-28097-rebased.patch: upstream #28097 (draft-head-only sidecar
-#     GGUFs, unsloth MTP/ layout incl. the "shared" embedding-borrowing
-#     variants) rebased onto the merged tree — the PR itself conflicts with
-#     master's newer PLE row-count logic (resolution: keep master's body, add
-#     the !mtp_only guards).
-# Regenerate a rebased patch when it drifts: merge its PR by hand on top of
-# the other merges and `git diff <merges-without-it> HEAD`. Same drift rules
-# as LLAMA_PATCHES: closed PRs are skipped, conflicts FAIL the build. Retire
-# the stage for real once #27836 + #28097 land upstream.
-# Retired 2026-09-04: qwen4exp-28136-merge-fix.patch — #28136 was rewritten
-# upstream (the direct-read setup now lives in llama_model_base::
-# load_lazy_reader, which nil-checks the weight itself), so the old semantic
-# merge fix is obsolete. Its log line moved too: "direct reads enabled for
-# <tensor>", no longer "PLE direct read enabled".
-ARG WITH_QWEN4EXP=true
-ARG QWEN4EXP_COMMIT="master"
-ARG QWEN4EXP_PATCHES="27952 28136 28213 28330"
+# llama-server-next / llama-bench-next: llama.cpp master + open upstream PRs
+# worth having before they merge ("next"). Vulkan-only, in every tag (the
+# ROCm/Strix Halo side is covered by EngramHalo above). Renamed from
+# -qwen4exp on 2026-09-06: it started as the MTP build for Qwen3.8-Flash-Next
+# (arch qwen4exp) and now carries general Vulkan/Qwen/server improvements, so
+# `benchmark --standalone --variant next <model>` decides per entry whether it
+# should run on this binary instead of plain llama-server. Built from
+# NEXT_COMMIT plus NEXT_PATCHES, merged in list order (same drift rules as
+# LLAMA_PATCHES: closed PRs are skipped, conflicts FAIL the build; dry-run the
+# whole set with `git merge` on a local clone before changing it). Set on
+# 2026-09-06 (all merged cleanly against master 74a7c897; #28422 topk_moe
+# fusion conflicts with #28024 and was left out):
+#   Vulkan backend
+#   #27952 int8 coopmat1 matmul for RDNA3/4 (same as LLAMA_PATCHES; +4.6% dense
+#          / +18.5% MoE pp512 on the XTX)
+#   #28024 rms_norm fusions (RMS_NORM+MUL+ADD, ROPE+VIEW+SET_ROWS) -- approved
+#   #27220 fuse UNARY(silu/gelu/sigmoid)+MUL incl. MoE shared-expert gating
+#          (2-3% on Qwen3.6 MoE upstream) -- approved
+#   #28253 type-aligned quantized GET_ROWS (correctness on views) -- approved
+#   #28457 small-M matmul tile selection for Qwen-shaped buckets (m=1/m=32)
+#   Models
+#   #28243 Qwen3.8-Flash-Next MTP draft head + draft-only sidecar loading
+#          (unsloth's upstream PR; supersedes the local #27836/#28097 rebases)
+#   #28068 gated-delta-net norm max->rsqrt (matches the Qwen reference) -- approved
+#   #28265 keep Qwen3.5-family delta-net out-proj 2D (Strix Halo: +6-9% TG at
+#          batch 4-8 = our --parallel 2 + MTP verify batches)
+#   #28213 gather-based sparse attention for qwen4exp QSA decode (+50% tg
+#          @130k upstream claim; measured 0 on RADV 2026-09-02, kept for depth)
+#   #28136 direct pread()s for the lazy PLE/n-gram table (cold-start prefill;
+#          throughput-neutral when the page cache is warm)
+#   #28330 no V cache for the qwen4exp lightning indexer (pure VRAM win)
+#   Speculative / server
+#   #27210 `--spec-type draft-mtp-adaptive` (opt-in; R9700 Qwen3.8-27B code
+#          53->72 t/s vs fixed n-max 3) -- to benchmark
+#   #28333 zero the MTP carrier at sequence start (determinism across requests)
+#   #25592 exact-position checkpoint restore for hybrid/recurrent models
+#          (agentic multi-turn @130k: 35 s -> 1.3 s turn restore) -- to benchmark
+# patches/*.patch (local rebased patches) apply after the merges; the directory
+# is EMPTY since 2026-09-06 (see patches/README.md). Retire PRs from the list as
+# they merge (the build says so) -- and watch #25773 (mul_mm rewrite): when it
+# lands, #27952 needs a rebase.
+ARG WITH_NEXT=true
+ARG NEXT_COMMIT="master"
+ARG NEXT_PATCHES="27952 28024 27220 28253 28457 28243 28068 28265 28213 28136 28330 27210 28333 25592"
 
 # Sources of the fixed Qwen chat templates shipped under
 # /etc/llama-swap/templates/ (fetched at build time):
@@ -369,18 +371,18 @@ BUILD
 
 # ── Build whisper.cpp (Vulkan) ─────────────────────────────────────────
 
-# ── Build llama.cpp (Vulkan) + open qwen4exp PRs → llama-server-qwen4exp ─
-# See the WITH_QWEN4EXP ARG block for the PR set and rationale.
+# ── Build llama.cpp (Vulkan) + open upstream PRs → llama-server-next ─
+# See the WITH_NEXT ARG block for the PR set and rationale.
 
-FROM vulkan-builder AS llama-qwen4exp
-ARG QWEN4EXP_COMMIT
-ARG QWEN4EXP_PATCHES
-COPY patches/ /build/qwen4exp-patches/
+FROM vulkan-builder AS llama-next
+ARG NEXT_COMMIT
+ARG NEXT_PATCHES
+COPY patches/ /build/next-patches/
 RUN --mount=type=cache,id=ccache-vulkan,target=/ccache <<'BUILD'
 #!/bin/bash
 set -euo pipefail
 
-COMMIT="${QWEN4EXP_COMMIT:-master}"
+COMMIT="${NEXT_COMMIT:-master}"
 
 echo "=== Cloning llama.cpp at ${COMMIT} ==="
 mkdir -p /src/llama.cpp && cd /src/llama.cpp
@@ -393,10 +395,10 @@ echo "llama.cpp at $(git rev-parse HEAD)"
 # Same PR-merge rules as the llama-vulkan stage: closed PRs are skipped (a
 # merged one is already in master), a conflicting merge FAILS the build.
 MERGED_PRS=""
-for pr in ${QWEN4EXP_PATCHES:-}; do
+for pr in ${NEXT_PATCHES:-}; do
     echo "=== Merging upstream PR #${pr} ==="
     if ! git ls-remote --exit-code origin "refs/pull/${pr}/merge" >/dev/null 2>&1; then
-        echo "PR #${pr} is closed on GitHub (merged or rejected) -- skipping; remove it from QWEN4EXP_PATCHES"
+        echo "PR #${pr} is closed on GitHub (merged or rejected) -- skipping; remove it from NEXT_PATCHES"
         continue
     fi
     git fetch --filter=blob:none origin "refs/pull/${pr}/head"
@@ -410,9 +412,9 @@ for pr in ${QWEN4EXP_PATCHES:-}; do
     MERGED_PRS="${MERGED_PRS} ${pr}"
 done
 
-# Local patches on top (currently: #28097 rebased, see the ARG block).
+# Local patches on top (patches/*.patch, see patches/README.md; none since 2026-09-06).
 # Reverse-applying = already upstream: skip.
-for p in /build/qwen4exp-patches/*.patch; do
+for p in /build/next-patches/*.patch; do
     [ -e "$p" ] || continue
     if git apply --check "$p" 2>/dev/null; then
         git apply "$p"; echo "applied local patch: $(basename "$p")"
@@ -436,7 +438,7 @@ for t in integer_dot bfloat16 coopmat; do
     fi
 done
 
-echo "=== Building llama.cpp (Vulkan, qwen4exp) ==="
+echo "=== Building llama.cpp (Vulkan, next) ==="
 cmake -B build \
     -DGGML_NATIVE=OFF \
     -DGGML_VULKAN=ON \
@@ -460,11 +462,11 @@ done
 cmake --build build --config Release -j"$(nproc)"
 
 echo "=== Collecting ==="
-OUT=/install/llama-qwen4exp
+OUT=/install/llama-next
 mkdir -p "$OUT"
 for bin in llama-server llama-bench; do
     [ -f "build/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
-    cp "build/bin/$bin" "$OUT/$bin-qwen4exp"
+    cp "build/bin/$bin" "$OUT/$bin-next"
 done
 cp -P build/bin/*.so* "$OUT/"
 ls "$OUT"/libggml-cpu-*.so >/dev/null 2>&1 || { echo "FATAL: no ggml-cpu variants built" >&2; exit 1; }
@@ -477,9 +479,9 @@ for f in "$OUT"/*; do
     if ldd "$f" 2>/dev/null | grep -q "not found"; then
         echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
 done
-{ echo "llama_qwen4exp_commit: $(git rev-parse HEAD) (requested: ${COMMIT})";
-  echo "llama_qwen4exp_prs:${MERGED_PRS:- none}";
-  echo "llama_qwen4exp_local_patches: $(ls /build/qwen4exp-patches/*.patch 2>/dev/null | xargs -rn1 basename | tr '\n' ' ')"; } > "$OUT/.build-info"
+{ echo "llama_next_commit: $(git rev-parse HEAD) (requested: ${COMMIT})";
+  echo "llama_next_prs:${MERGED_PRS:- none}";
+  echo "llama_next_local_patches: $(ls /build/next-patches/*.patch 2>/dev/null | xargs -rn1 basename | tr '\n' ' ')"; } > "$OUT/.build-info"
 BUILD
 
 FROM vulkan-builder AS whisper-vulkan
@@ -1008,7 +1010,7 @@ BUILD
 # HIP builders are never started.
 
 FROM alpine:3 AS rocm-none
-RUN mkdir -p /install/bin /install/llama-rocm /install/llama-engram /install/llama-qwen4exp
+RUN mkdir -p /install/bin /install/llama-rocm /install/llama-engram /install/llama-next
 
 FROM llama-rocm   AS llama-rocm-true
 FROM whisper-rocm AS whisper-rocm-true
@@ -1029,10 +1031,10 @@ FROM rocm-none    AS llama-engram-false-true
 FROM rocm-none    AS llama-engram-false-false
 FROM llama-engram-${WITH_ROCM}-${WITH_ENGRAM} AS llama-engram-sel
 
-# qwen4exp is a Vulkan build — selected by its own switch, in every tag.
-FROM llama-qwen4exp AS llama-qwen4exp-true
-FROM rocm-none      AS llama-qwen4exp-false
-FROM llama-qwen4exp-${WITH_QWEN4EXP} AS llama-qwen4exp-sel
+# -next is a Vulkan build — selected by its own switch, in every tag.
+FROM llama-next AS llama-next-true
+FROM rocm-none      AS llama-next-false
+FROM llama-next-${WITH_NEXT} AS llama-next-sel
 
 # ── Final image: base (+ ROCm runtime) + rebuilt binaries ──────────────
 
@@ -1047,7 +1049,7 @@ ARG QWEN_TEMPLATE_URL
 ARG QWEN_SHARP_TEMPLATE_URL
 ARG WITH_ROCM
 ARG WITH_ENGRAM
-ARG WITH_QWEN4EXP
+ARG WITH_NEXT
 
 LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-docker-amd" \
       org.opencontainers.image.description="llama-swap unified image for AMD GPUs (ROCm + Vulkan)"
@@ -1129,7 +1131,7 @@ COPY --from=llama-rocm-sel   /install/llama-rocm/ /opt/llama-rocm/
 COPY --from=whisper-rocm-sel /install/bin/ /usr/local/bin/
 COPY --from=sd-rocm-sel      /install/bin/ /usr/local/bin/
 COPY --from=llama-engram-sel /install/llama-engram/ /opt/llama-engram/
-COPY --from=llama-qwen4exp-sel /install/llama-qwen4exp/ /opt/llama-qwen4exp/
+COPY --from=llama-next-sel /install/llama-next/ /opt/llama-next/
 RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
         ln -sf "/opt/llama-vulkan/$bin" "/usr/local/bin/$bin"; \
         if [ "${WITH_ROCM}" = "true" ]; then \
@@ -1142,11 +1144,11 @@ RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
             ln -sf "/opt/llama-engram/$bin-engram" "/usr/local/bin/$bin-engram"; \
         done; \
     else rmdir /opt/llama-engram; fi \
-    && if [ "${WITH_QWEN4EXP}" = "true" ]; then \
+    && if [ "${WITH_NEXT}" = "true" ]; then \
         for bin in llama-server llama-bench; do \
-            ln -sf "/opt/llama-qwen4exp/$bin-qwen4exp" "/usr/local/bin/$bin-qwen4exp"; \
+            ln -sf "/opt/llama-next/$bin-next" "/usr/local/bin/$bin-next"; \
         done; \
-    else rmdir /opt/llama-qwen4exp; fi
+    else rmdir /opt/llama-next; fi
 
 # Example config with both backends; override by mounting /etc/llama-swap/config
 # `benchmark` CLI (scripts/benchmark): server-level (via llama-swap), kernel-level
@@ -1193,9 +1195,9 @@ if [ "${WITH_ROCM}" = "true" ] && [ "${WITH_ENGRAM}" = "true" ]; then
     BINS="$BINS llama-server-engram llama-cli-engram llama-bench-engram"
     SERVERS="$SERVERS llama-server-engram"
 fi
-if [ "${WITH_QWEN4EXP}" = "true" ]; then
-    BINS="$BINS llama-server-qwen4exp llama-bench-qwen4exp"
-    SERVERS="$SERVERS llama-server-qwen4exp"
+if [ "${WITH_NEXT}" = "true" ]; then
+    BINS="$BINS llama-server-next llama-bench-next"
+    SERVERS="$SERVERS llama-server-next"
 fi
 for bin in $BINS; do
     out=$(ldd "$(readlink -f "$(command -v "$bin")")")
@@ -1205,7 +1207,7 @@ for bin in $BINS; do
         exit 1
     fi
 done
-for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*) $([ -d /opt/llama-engram ] && echo /opt/llama-engram/*.so*) $([ -d /opt/llama-qwen4exp ] && echo /opt/llama-qwen4exp/*.so*); do
+for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*) $([ -d /opt/llama-engram ] && echo /opt/llama-engram/*.so*) $([ -d /opt/llama-next ] && echo /opt/llama-next/*.so*); do
     if ldd "$lib" | grep -q 'not found'; then
         echo "FATAL: $lib has unresolved libraries:" >&2; ldd "$lib" | grep 'not found' >&2; exit 1; fi
 done
@@ -1235,7 +1237,7 @@ RUN { echo "with_rocm: ${WITH_ROCM}"; \
       cat /opt/llama-vulkan/.build-info; \
       if [ "${WITH_ROCM}" = "true" ]; then cat /opt/llama-rocm/.build-info; fi; \
       if [ -d /opt/llama-engram ]; then cat /opt/llama-engram/.build-info; fi; \
-      if [ -d /opt/llama-qwen4exp ]; then cat /opt/llama-qwen4exp/.build-info; fi; \
+      if [ -d /opt/llama-next ]; then cat /opt/llama-next/.build-info; fi; \
       echo "cpu_variants: $(ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ')"; \
       echo "mesa_ppa: ${MESA_PPA:-none}"; \
       echo "qwen_chat_template: $(grep -o 'template_version = "[^"]*"' /etc/llama-swap/templates/qwen-fixed.jinja | head -1 | cut -d'"' -f2) (${QWEN_TEMPLATE_URL})"; \

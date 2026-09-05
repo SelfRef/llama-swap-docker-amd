@@ -14,7 +14,7 @@
 |---|---|---|
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `llama-server`, `llama-cli`, `llama-tts`, `llama-bench` | `llama-server-rocm`, `llama-cli-rocm`, `llama-tts-rocm`, `llama-bench-rocm` |
 | [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp) (llama.cpp fork, Strix Halo/qwen4exp) | — (fork is ROCm/HIP-only) | `llama-server-engram`, `llama-cli-engram`, `llama-bench-engram` (gfx1151 only) |
-| llama.cpp + open qwen4exp PRs (MTP for Qwen3.8-Flash-Next) | `llama-server-qwen4exp`, `llama-bench-qwen4exp` (all tags, `WITH_QWEN4EXP`) | — (use `*-engram` on Strix Halo) |
+| llama.cpp master + open upstream PRs ("next": Vulkan fusions, Qwen fixes, qwen4exp MTP, adaptive MTP, checkpoint restore -- see [Trying upstream PRs](#trying-upstream-prs)) | `llama-server-next`, `llama-bench-next` (all tags, `WITH_NEXT`) | — (use `*-engram` on Strix Halo) |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | `whisper-server`, `whisper-cli` | `whisper-server-rocm`, `whisper-cli-rocm` |
 | [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | `sd-server` (web UI embedded), `sd-cli` | `sd-server-rocm` (web UI embedded), `sd-cli-rocm` |
 | [audio.cpp](https://github.com/0xShug0/audio.cpp) | `audiocpp_server`, `audiocpp_cli` (from base image); `audiocpp_gguf` (GGUF converter, built here, CPU-only, all tags) | — (no HIP backend upstream) |
@@ -65,8 +65,8 @@ Build args:
 | `WITH_ENGRAM` | `true` | Build [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp) as `*-engram` binaries. Only takes effect together with `WITH_ROCM=true` (the fork is HIP-only), so `:latest` never contains it. `false` skips the stage. |
 | `ENGRAM_REPO` / `ENGRAM_BRANCH` | Aristo94's repo, `strix-halo-qwen4exp` | Fork source. The branch rebases onto llama.cpp master and carries the Strix Halo patch series. |
 | `ENGRAM_TARGETS` | `gfx1151` | gfx targets for the EngramHalo build. gfx1151 alone on purpose: the fork's kernels are tuned for and only validated on Strix Halo. |
-| `WITH_QWEN4EXP` | `true` | Build `llama-server-qwen4exp` + `llama-bench-qwen4exp` (Vulkan): master + the still-open qwen4exp PRs — #27836 MTP draft head and #28097 unsloth sidecar loading (both as rebased local patches), #28136 PLE direct reads (`--lazy-mode on-direct`), #28213 QSA gather decode, #28330 no indexer V cache, #27952 int8 coopmat. Restored 2026-09-02: the merged Sep 1 upstream set (#27941/#28040/#28123/#28023/#28121) did NOT include MTP (#28104 was withdrawn). Retire once #27836+#28097 merge. |
-| `QWEN4EXP_COMMIT` / `QWEN4EXP_PATCHES` | `master` / `27952 28136 28213 28330` | Revision + PR set for that build; same drift rules as `LLAMA_PATCHES`. `patches/*.patch` apply on top (currently the rebased #27836 and #28097 — #27836 stopped merging cleanly on 2026-09-04, master's per-layer `n_ff_exp_arr`) and fail the build loudly when they stop applying. |
+| `WITH_NEXT` | `true` | Build `llama-server-next` + `llama-bench-next` (Vulkan): llama.cpp master + the open upstream PRs in `NEXT_PATCHES`. Started 2026-09-02 as the MTP build for Qwen3.8-Flash-Next (`-qwen4exp`), renamed 2026-09-06 when it became the general "try the open PRs" build; `benchmark --standalone --variant next <model>` shows per entry whether it beats plain `llama-server`. |
+| `NEXT_COMMIT` / `NEXT_PATCHES` | `master` / `27952 28024 27220 28253 28457 28243 28068 28265 28213 28136 28330 27210 28333 25592` | Revision + PR set for that build, merged in list order; same drift rules as `LLAMA_PATCHES`. `patches/*.patch` (local rebased patches, empty since 2026-09-06) apply on top and fail the build loudly when they stop applying. The set is listed with rationale in the Dockerfile ARG block. |
 | `MESA_PPA` | `ppa:kisak/kisak-mesa` | Newer Mesa/RADV for the final image; `""` keeps the base image's stock Mesa 25.2 |
 | `QWEN_TEMPLATE_URL` | froggeric's `chat_template.jinja` | Source of the fixed Qwen chat template shipped at `/etc/llama-swap/templates/qwen-fixed.jinja` (see below) |
 | `QWEN_SHARP_TEMPLATE_URL` | peculiar-ragdoll's `chat_template.jinja` | Source of the Sharp variant shipped at `/etc/llama-swap/templates/qwen-sharp.jinja` (see below) |
@@ -107,6 +107,25 @@ Measured on an RX 7900 XTX with this image (Mesa 26.1, llama-bench, q8_0/q4_0 KV
 | [#25483](https://github.com/ggml-org/llama.cpp/pull/25483) | Vulkan: skip unneeded MoE work in coopmat1 mul_mm | +0.3% | +0.2% | unchanged | not worth a patch |
 | [#26284](https://github.com/ggml-org/llama.cpp/pull/26284) + [#26301](https://github.com/ggml-org/llama.cpp/pull/26301) | HIP: RDNA3 MMQ tuning + dequant-float matvec | ROCm 977 → 1000 (+2%, within noise) | +2% | unchanged | not adopted (#26284 still carries RDNA4 changes its reviewer wants removed; re-test when merged) |
 | [#22970](https://github.com/ggml-org/llama.cpp/pull/22970) | Vulkan K-quant A-matrix transpose | – | – | – | stale, conflicts with master |
+
+The `-next` binaries carry a larger set (`NEXT_PATCHES`, dry-run merged clean against master `74a7c897` on 2026-09-06 — `#28422` was dropped for conflicting with `#28024`):
+
+| PR | area | what | status upstream |
+|---|---|---|---|
+| [#27952](https://github.com/ggml-org/llama.cpp/pull/27952) | Vulkan | int8 coopmat1 matmul (RDNA3/4) | open, measured (table above) |
+| [#28024](https://github.com/ggml-org/llama.cpp/pull/28024) | Vulkan | rms_norm / rope fusions | approved by 0cc4m |
+| [#27220](https://github.com/ggml-org/llama.cpp/pull/27220) | Vulkan | UNARY+MUL fusion (MoE shared-expert gating) | approved by jeffbolznv |
+| [#28253](https://github.com/ggml-org/llama.cpp/pull/28253) | Vulkan | type-aligned quantized GET_ROWS | approved ×4 |
+| [#28457](https://github.com/ggml-org/llama.cpp/pull/28457) | Vulkan | small-M matmul tiles for Qwen buckets | new |
+| [#28243](https://github.com/ggml-org/llama.cpp/pull/28243) | models | Qwen3.8-Flash-Next MTP + draft-only sidecar (unsloth) | draft, ggerganov reviewing |
+| [#28068](https://github.com/ggml-org/llama.cpp/pull/28068) | models | GDN norm max→rsqrt | approved ×2 |
+| [#28265](https://github.com/ggml-org/llama.cpp/pull/28265) | models | Qwen3.5-family delta-net out-proj 2D (+6-9% batched TG on Strix Halo) | open |
+| [#28213](https://github.com/ggml-org/llama.cpp/pull/28213) | models | qwen4exp QSA gather decode | open |
+| [#28136](https://github.com/ggml-org/llama.cpp/pull/28136) | loading | direct reads for the lazy PLE table | approved by pwilkin |
+| [#28330](https://github.com/ggml-org/llama.cpp/pull/28330) | memory | no V cache for the qwen4exp indexer | approved by pwilkin |
+| [#27210](https://github.com/ggml-org/llama.cpp/pull/27210) | spec | `--spec-type draft-mtp-adaptive` (opt-in) | open |
+| [#28333](https://github.com/ggml-org/llama.cpp/pull/28333) | spec | zero MTP carrier at sequence start | open |
+| [#25592](https://github.com/ggml-org/llama.cpp/pull/25592) | server | exact-position checkpoint restore (hybrid/recurrent) | open |
 
 ## Run
 
@@ -175,7 +194,7 @@ docker compose exec llama-swap benchmark                         # every listed 
 docker compose exec llama-swap benchmark qwen38 qwen38-hh        # server-level, via llama-swap
 docker compose exec llama-swap benchmark --prompt prose,prefill --prefill-tokens 65536 qwen38-fl
 docker compose exec llama-swap benchmark --kernel --std --unload qwen38      # llama-bench, community-comparable line
-docker compose exec llama-swap benchmark --kernel --variant qwen4exp qwen38-fl
+docker compose exec llama-swap benchmark --kernel --variant next qwen38-fl
 docker compose exec llama-swap benchmark --standalone --variant rocm --unload qwen38   # this entry on the ROCm build
 docker compose exec llama-swap benchmark --sampled qwen38:l      # production sampling + filters (not comparable)
 docker compose exec llama-swap benchmark --list                  # parsed entries, no requests
