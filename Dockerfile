@@ -155,8 +155,10 @@ ARG LLAMA_COMMIT="master"
 # (stale, conflicts with master).
 ARG LLAMA_PATCHES="27952"
 
-# llama-server-qwen4exp: an EXTRA llama-server for Qwen3.8-Flash-Next (arch
-# qwen4exp), restored 2026-09-02 (the 2026-09-01 removal was premature: the
+# llama-server-qwen4exp (+ llama-bench-qwen4exp, added 2026-09-05 so the
+# patched build can be A/B-ed kernel-level like every other variant): an EXTRA
+# llama-server for Qwen3.8-Flash-Next (arch qwen4exp), restored 2026-09-02
+# (the 2026-09-01 removal was premature: the
 # #27742/#27941/#28040/#28123/#28023/#28121 set did merge upstream, but MTP
 # itself did NOT — #28104 was withdrawn by its author on 2026-09-01, and the
 # competing implementation #27836 + the unsloth-sidecar loader #28097 are
@@ -460,8 +462,10 @@ cmake --build build --config Release -j"$(nproc)"
 echo "=== Collecting ==="
 OUT=/install/llama-qwen4exp
 mkdir -p "$OUT"
-[ -f build/bin/llama-server ] || { echo "FATAL: llama-server not built" >&2; exit 1; }
-cp build/bin/llama-server "$OUT/llama-server-qwen4exp"
+for bin in llama-server llama-bench; do
+    [ -f "build/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
+    cp "build/bin/$bin" "$OUT/$bin-qwen4exp"
+done
 cp -P build/bin/*.so* "$OUT/"
 ls "$OUT"/libggml-cpu-*.so >/dev/null 2>&1 || { echo "FATAL: no ggml-cpu variants built" >&2; exit 1; }
 ls "$OUT"/libggml-vulkan.so >/dev/null 2>&1 || { echo "FATAL: libggml-vulkan.so not built" >&2; exit 1; }
@@ -1139,10 +1143,20 @@ RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
         done; \
     else rmdir /opt/llama-engram; fi \
     && if [ "${WITH_QWEN4EXP}" = "true" ]; then \
-        ln -sf /opt/llama-qwen4exp/llama-server-qwen4exp /usr/local/bin/llama-server-qwen4exp; \
+        for bin in llama-server llama-bench; do \
+            ln -sf "/opt/llama-qwen4exp/$bin-qwen4exp" "/usr/local/bin/$bin-qwen4exp"; \
+        done; \
     else rmdir /opt/llama-qwen4exp; fi
 
 # Example config with both backends; override by mounting /etc/llama-swap/config
+# `benchmark` CLI (scripts/benchmark): server-level (via llama-swap), kernel-level
+# (llama-bench[-variant]) and standalone (llama-server-<variant>) benchmarks of the
+# config.yaml text entries, one table. Pure python3 + PyYAML; the base is PEP-668
+# externally managed (no pip), so PyYAML comes from apt.
+RUN apt-get update && apt-get install -y --no-install-recommends python3-yaml \
+    && rm -rf /var/lib/apt/lists/*
+COPY --chmod=0755 scripts/benchmark /usr/local/bin/benchmark
+
 COPY config/config.yaml /etc/llama-swap/config/config.yaml
 
 # Fixed Qwen 3.5/3.6/3.8 chat templates for `--chat-template-file`:
@@ -1180,7 +1194,7 @@ if [ "${WITH_ROCM}" = "true" ] && [ "${WITH_ENGRAM}" = "true" ]; then
     SERVERS="$SERVERS llama-server-engram"
 fi
 if [ "${WITH_QWEN4EXP}" = "true" ]; then
-    BINS="$BINS llama-server-qwen4exp"
+    BINS="$BINS llama-server-qwen4exp llama-bench-qwen4exp"
     SERVERS="$SERVERS llama-server-qwen4exp"
 fi
 for bin in $BINS; do
@@ -1196,6 +1210,9 @@ for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/ll
         echo "FATAL: $lib has unresolved libraries:" >&2; ldd "$lib" | grep 'not found' >&2; exit 1; fi
 done
 echo "All binaries and libraries resolve their shared libraries."
+python3 -c "import yaml" || { echo "FATAL: python3-yaml missing (benchmark needs it)" >&2; exit 1; }
+benchmark --list --config /etc/llama-swap/config/config.yaml >/dev/null \
+    || { echo "FATAL: benchmark --list failed on the bundled config" >&2; exit 1; }
 for bin in $SERVERS; do
     "$bin" --version
     out=$("$bin" --list-devices 2>&1 || true)

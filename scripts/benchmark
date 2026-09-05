@@ -1,0 +1,1365 @@
+#!/usr/bin/env python3
+"""benchmark -- one benchmark CLI for every llama.cpp text entry in llama-swap.
+
+Run INSIDE the llama-swap container (baked to /usr/local/bin/benchmark):
+
+    docker compose exec llama-swap benchmark [options] [model ...]
+
+Four modes, one table:
+
+  SERVER (default)   Requests go through llama-swap's /upstream/<model>/ raw proxy,
+                     which swap-loads the entry exactly as production does (MTP,
+                     mmproj, --parallel, KV types ...) but skips the OpenAI-route
+                     filters (setParams would overwrite temperature and break
+                     determinism). Every measured request is GREEDY (temp 0,
+                     top_k 1, seed 42, cache_prompt off) with a fixed n_predict
+                     where that makes sense, so the numbers are pure throughput
+                     and the content hash is a determinism check.
+  --kernel           llama-bench[-<variant>] on the entry's GGUF with the entry's
+                     KV/batch/placement flags (or --std for the fixed community-
+                     comparable line). No speculative decoding, no mmproj: this is
+                     the "hardware/build" number, not the "what users get" number.
+  --standalone       Spawn llama-server-<variant> with the entry's exact cmd (port
+                     and host substituted), bench it like SERVER mode, kill it.
+                     For binary A/Bs (Vulkan vs ROCm vs a patched build) without a
+                     temporary config entry.
+  --sampled          Through llama-swap's /v1/chat/completions, so the entry's
+                     filters (production sampling, :l/:m/:x aliases) apply. NOT
+                     comparable with greedy rows; the hash column is blank.
+
+Things the numbers have taught us (keep in mind when reading a row):
+  * accept  -- speculative entries only: draft tokens accepted / drafted. The gain
+               is ENTIRELY prompt-dependent (~50% on prose, ~100% on copy/JSON), so
+               never rank spec variants on one preset.
+  * gtt     -- GPU GTT (system RAM over PCIe) in use while the model is resident.
+               If a model that should fit in VRAM pushes gtt up by more than
+               --spill-threshold the row is flagged SPILL and every t/s in it is a
+               lie (4-6x too low). On UMA GPUs (Strix Halo) gtt IS the pool, so the
+               check is disabled there.
+  * hash    -- sha256 of the FIRST measured output. Reproducible across invocations
+               and fresh loads for the same request sequence (warmup + measure), so
+               it compares builds/configs. It is NOT stable between consecutive
+               identical requests on an already-loaded server (measured 2026-09-05
+               on both MTP and plain entries), which is why --repeat only medians
+               the t/s and does not compare hashes.
+  * guard   -- other services (Open WebUI, n8n, mem0, the web UI in a browser) hit
+               llama-swap whenever they like and a model they load mid-run wrecks the
+               measurement. So the tool holds the box: a watcher thread polls
+               /running and immediately unloads every model that is not the one
+               under test (their requests fail for that moment -- accepted, this is a
+               benchmark). Rows that saw an intruder are flagged EVICTED:<n>;
+               --no-guard turns the watcher off (then a stranger just gets
+               CONTAMINATED). Requests to the SAME model on another slot cannot be
+               blocked; they are detected via llama-server's /metrics counters and
+               flagged SHARED.
+  * Benchmark on an idle box; single runs are +-5%, the first run after an image
+    switch can read ~10% low.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import glob
+import hashlib
+import json
+import os
+import random
+import re
+import shlex
+import shutil
+import socket
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+
+try:
+    import yaml
+except ImportError:  # image without python3-yaml (pre-2026-09 builds): re-exec via uv
+    if os.environ.get("BENCHMARK_REEXEC") or not shutil.which("uv"):
+        sys.exit("benchmark: PyYAML missing -- apt-get install python3-yaml "
+                 "(or have uv on PATH for the fallback)")
+    os.environ["BENCHMARK_REEXEC"] = "1"
+    os.execvp("uv", ["uv", "run", "--quiet", "--no-project", "--with", "pyyaml",
+                     "python3", os.path.abspath(__file__), *sys.argv[1:]])
+
+# ── constants ────────────────────────────────────────────────────────────────
+CONFIG = "/etc/llama-swap/config/config.yaml"
+BASE = "http://localhost:8080"
+VERSIONS = "/versions.txt"
+N_WARMUP = 16
+# id_slot pins every request to slot 0: on --parallel N servers the slot (and with
+# --kv-unified the position in the shared cache) would otherwise vary between
+# identical requests and change the greedy path -> spurious DRIFT.
+GREEDY = {"temperature": 0, "top_k": 1, "seed": 42, "id_slot": 0}
+# The community-comparable llama-bench line (LLM_BENCHMARK.md, "kernel-level").
+STANDARD_BENCH = ["-fa", "1", "-ctk", "q8_0", "-ctv", "q4_0", "-b", "2048", "-ub", "512",
+                  "-p", "512", "-n", "128", "-d", "0,8192"]
+FIT_MARGIN_MIB = 1024  # llama-server's --fit on default margin (1 GiB)
+VARIANTS = ("vulkan", "rocm", "engram", "qwen4exp")
+SIDECAR_PREFIXES = ("mmproj-", "mtp-", "dflash-", "eagle3-", "dspark-")
+PROMPT_ALIASES = {"story": "prose", "code": "json"}
+
+
+class UserError(Exception):
+    """Preflight / usage problem: message to stderr, exit 2."""
+
+
+def warn(msg: str) -> None:
+    print(f"benchmark: {msg}", file=sys.stderr, flush=True)
+
+
+# ── config entries ───────────────────────────────────────────────────────────
+@dataclass
+class Entry:
+    key: str
+    argv: list[str]
+    binary: str
+    hf_repo: str | None = None
+    hf_tag: str | None = None
+    hf_file: str | None = None
+    model_path: str | None = None
+    draft_repo: str | None = None
+    draft_file: str | None = None
+    ctx: int | None = None
+    ctk: str = "f16"
+    ctv: str = "f16"
+    batch: int | None = None
+    ubatch: int | None = None
+    ngl: str | None = None          # "all", "0", "12" ... None = binary default
+    fit: str | None = None          # "on"/"off"
+    spec_type: str | None = None
+    spec_nmax: int | None = None
+    threads: int | None = None
+    n_cpu_moe: int | None = None
+    lazy_mode: str | None = None
+    caps_in: list[str] = field(default_factory=list)
+    caps_out: list[str] = field(default_factory=list)
+    unlisted: bool = False
+    aliases: list[str] = field(default_factory=list)
+    tier_ids: list[str] = field(default_factory=list)   # setParamsByID keys (${MODEL_ID}:l ...)
+    groups: list[str] = field(default_factory=list)
+    health_timeout: int = 300
+
+    @property
+    def variant(self) -> str:
+        m = re.match(r"llama-server(?:-(\w+))?$", os.path.basename(self.binary))
+        return (m.group(1) if m and m.group(1) else "vulkan")
+
+    @property
+    def is_text(self) -> bool:
+        return (os.path.basename(self.binary).startswith("llama-server")
+                and "text" in self.caps_out and "text" in self.caps_in)
+
+    @property
+    def quant(self) -> str:
+        if self.hf_tag:
+            return self.hf_tag
+        stem = os.path.splitext(os.path.basename(self.hf_file or self.model_path or ""))[0]
+        m = re.search(r"[-.]([A-Za-z0-9_]+)$", stem)
+        return m.group(1) if m else (stem or "?")
+
+    def params(self, extra: str | None = None) -> str:
+        def kv(t: str) -> str:
+            return {"q8_0": "q8", "q4_0": "q4", "q4_1": "q4_1", "q5_0": "q5", "q5_1": "q5_1",
+                    "iq4_nl": "iq4", "f16": "f16", "bf16": "bf16", "f32": "f32"}.get(t, t)
+        parts = [self.quant]
+        if self.ctx:
+            parts.append(f"{self.ctx // 1000}k")   # 131072 -> 131k, as in the benchmark log
+        parts.append(f"{kv(self.ctk)}/{kv(self.ctv)}" if self.ctk != self.ctv else kv(self.ctk))
+        if self.spec_type:
+            s = self.spec_type.replace("draft-", "")
+            if self.spec_nmax is not None:
+                s += str(self.spec_nmax)
+            if self.draft_file:
+                s += "+sidecar"
+            parts.append(s)
+        if self.fit == "on":
+            parts.append("fit")
+        elif self.ngl is not None:
+            parts.append(f"ngl={self.ngl}")
+        if self.batch or self.ubatch:
+            parts.append(f"b{self.batch or 2048}/{self.ubatch or 512}")
+        if extra:
+            parts.append(extra)
+        return " ".join(parts)
+
+
+# flag -> (attribute, converter)
+_FLAGS: dict[str, tuple[str, type | None]] = {
+    "--ctx-size": ("ctx", int), "-c": ("ctx", int),
+    "--cache-type-k": ("ctk", None), "-ctk": ("ctk", None),
+    "--cache-type-v": ("ctv", None), "-ctv": ("ctv", None),
+    "--batch-size": ("batch", int), "-b": ("batch", int),
+    "--ubatch-size": ("ubatch", int), "-ub": ("ubatch", int),
+    "--n-gpu-layers": ("ngl", None), "-ngl": ("ngl", None), "--gpu-layers": ("ngl", None),
+    "--fit": ("fit", None),
+    "--spec-type": ("spec_type", None),
+    "--spec-draft-n-max": ("spec_nmax", int),
+    "--spec-draft-hf": ("draft_repo", None), "-hfd": ("draft_repo", None),
+    "--spec-draft-model": ("draft_file", None), "-md": ("draft_file", None),
+    "--hf-file": ("hf_file", None), "-hff": ("hf_file", None),
+    "--model": ("model_path", None), "-m": ("model_path", None),
+    "--threads": ("threads", int), "-t": ("threads", int),
+    "--n-cpu-moe": ("n_cpu_moe", int), "-ncmoe": ("n_cpu_moe", int),
+    "--lazy-mode": ("lazy_mode", None), "-lzm": ("lazy_mode", None),
+}
+
+
+def parse_entry(key: str, m: dict, cfg: dict) -> Entry:
+    cmd = (m.get("cmd") or "").replace("${PORT}", "0")
+    argv = shlex.split(cmd)
+    if not argv:
+        raise UserError(f"{key}: empty cmd")
+    e = Entry(key=key, argv=argv, binary=argv[0])
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if a in ("-hf", "-hfr", "--hf-repo") and nxt:
+            repo, _, tag = nxt.partition(":")
+            e.hf_repo, e.hf_tag = repo, (tag or None)
+            i += 2
+            continue
+        if a in _FLAGS and nxt is not None and not nxt.startswith("-"):
+            attr, conv = _FLAGS[a]
+            try:
+                setattr(e, attr, conv(nxt) if conv else nxt)
+            except ValueError:
+                pass
+            i += 2
+            continue
+        i += 1
+    caps = m.get("capabilities") or {}
+    e.caps_in = list(caps.get("in") or [])
+    e.caps_out = list(caps.get("out") or [])
+    e.unlisted = bool(m.get("unlisted"))
+    e.aliases = list(m.get("aliases") or [])
+    e.tier_ids = [k.replace("${MODEL_ID}", key)
+                  for k in ((m.get("filters") or {}).get("setParamsByID") or {})]
+    e.groups = [g for g, gd in (cfg.get("groups") or {}).items()
+                if key in (gd.get("members") or [])]
+    e.health_timeout = int(cfg.get("healthCheckTimeout") or 300)
+    return e
+
+
+class Config:
+    def __init__(self, path: str):
+        with open(path) as f:
+            self.raw = yaml.safe_load(f) or {}
+        self.path = path
+        self.entries: dict[str, Entry] = {}
+        for key, m in (self.raw.get("models") or {}).items():
+            try:
+                self.entries[key] = parse_entry(key, m or {}, self.raw)
+            except UserError as ex:
+                warn(str(ex))
+        self.peers = self.raw.get("peers") or {}
+
+    def text_entries(self) -> list[Entry]:
+        return [e for e in self.entries.values() if e.is_text and not e.unlisted]
+
+    def llama_entries(self) -> list[Entry]:
+        return [e for e in self.entries.values()
+                if os.path.basename(e.binary).startswith("llama-server")]
+
+    def resolve(self, name: str, sampled: bool) -> tuple[Entry, str]:
+        """-> (entry, model field to send). Aliases resolve to their parent."""
+        if "/" in name:
+            peer, _, rest = name.partition("/")
+            if peer in self.peers:
+                raise UserError(f"{name}: served by remote peer '{peer}' -- run benchmark on that box")
+        for peer, pd in self.peers.items():
+            if name in (pd.get("models") or []) and name not in self.entries:
+                raise UserError(f"{name}: only exists on peer '{peer}' -- run benchmark on that box")
+        if name in self.entries:
+            e = self.entries[name]
+        else:
+            parent = next((e for e in self.entries.values()
+                           if name in e.aliases or name in e.tier_ids), None)
+            if parent is None:
+                raise UserError(f"{name}: not a model in {self.path} (try --list)")
+            e = parent
+            if not sampled:
+                warn(f"{name} is an alias of {e.key}; filters do not apply via /upstream, "
+                     f"benchmarking {e.key} (use --sampled to bench the alias itself)")
+                name = e.key
+        if not os.path.basename(e.binary).startswith("llama-server"):
+            raise UserError(f"{e.key}: not a llama-server entry ({os.path.basename(e.binary)})")
+        if "text" not in e.caps_out:
+            raise UserError(f"{e.key}: not a text-output entry (capabilities.out={e.caps_out})")
+        return e, name
+
+
+# ── HF cache resolution (kernel mode) ────────────────────────────────────────
+def hub_dir() -> str:
+    for var in ("LLAMA_CACHE", "HF_HUB_CACHE"):
+        if os.environ.get(var):
+            return os.environ[var]
+    if os.environ.get("HF_HOME"):
+        return os.path.join(os.environ["HF_HOME"], "hub")
+    return os.path.expanduser("~/.cache/huggingface/hub")
+
+
+def cached_files(repo: str) -> tuple[str, list[str]]:
+    """-> (snapshot dir, relative paths) the way llama.cpp's hf_cache reads it."""
+    d = os.path.join(hub_dir(), "models--" + repo.replace("/", "--"))
+    refs = os.path.join(d, "refs")
+    if not os.path.isdir(refs):
+        raise UserError(f"{repo}: not in the HF cache ({d}) -- run update-models or load the entry once")
+    ref = os.path.join(refs, "main")
+    if not os.path.isfile(ref):
+        cands = sorted(os.listdir(refs))
+        if not cands:
+            raise UserError(f"{repo}: no refs in {refs}")
+        ref = os.path.join(refs, cands[0])
+    sha = open(ref).read().strip()
+    snap = os.path.join(d, "snapshots", sha)
+    if not os.path.isdir(snap):
+        raise UserError(f"{repo}: snapshot {sha} missing under {d}/snapshots")
+    files = []
+    for root, _dirs, names in os.walk(snap):
+        for n in names:
+            files.append(os.path.relpath(os.path.join(root, n), snap))
+    return snap, sorted(files)
+
+
+def is_model_gguf(rel: str) -> bool:
+    b = os.path.basename(rel)
+    return b.endswith(".gguf") and not b.startswith(SIDECAR_PREFIXES)
+
+
+def resolve_gguf(e: Entry) -> str:
+    if e.model_path:
+        if not os.path.exists(e.model_path):
+            raise UserError(f"{e.key}: {e.model_path} does not exist")
+        return e.model_path
+    if not e.hf_repo:
+        raise UserError(f"{e.key}: no -hf / -m in cmd, cannot locate the GGUF")
+    snap, files = cached_files(e.hf_repo)
+    if e.hf_file:
+        if e.hf_file in files:
+            return os.path.join(snap, e.hf_file)
+        raise UserError(f"{e.key}: {e.hf_file} not in the cached snapshot of {e.hf_repo}")
+    tag = e.hf_tag or "Q4_K_M"
+    pat = re.compile(re.escape(tag) + r"[.-]", re.IGNORECASE)
+    shard = re.compile(r"-(\d{5})-of-\d{5}\.gguf$")
+    cands = []
+    for rel in files:
+        if not is_model_gguf(rel) or not pat.search(rel):
+            continue
+        m = shard.search(rel)
+        if m and int(m.group(1)) != 1:
+            continue
+        cands.append(rel)
+    if not cands:
+        raise UserError(f"{e.key}: no GGUF matching '{tag}' in the cached {e.hf_repo} "
+                        f"-- run update-models or load the entry once")
+    exact = [c for c in cands if re.search(r"[-.]" + re.escape(tag) + r"(-00001-of-\d{5})?\.gguf$",
+                                           os.path.basename(c), re.IGNORECASE)]
+    pick = (exact or cands)[0]
+    if len(cands) > 1:
+        warn(f"{e.key}: several GGUFs match '{tag}' ({', '.join(cands)}); using {pick}")
+    return os.path.join(snap, pick)
+
+
+# ── HTTP / llama-swap ────────────────────────────────────────────────────────
+def http(method: str, url: str, body: dict | None = None, headers: dict | None = None,
+         timeout: float = 60) -> tuple[int, bytes]:
+    data = json.dumps(body).encode() if body is not None else None
+    h = {"Content-Type": "application/json", **(headers or {})}
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as ex:
+        return ex.code, ex.read()
+
+
+class Target:
+    """Where requests go: llama-swap upstream proxy, llama-swap OpenAI route, or a
+    standalone llama-server. Presets only ever call post()/get()."""
+
+    def __init__(self, base: str, prefix: str, headers: dict, model: str, timeout: float):
+        self.base, self.prefix, self.headers, self.model, self.timeout = base, prefix, headers, model, timeout
+
+    def post(self, path: str, body: dict) -> dict:
+        status, raw = http("POST", f"{self.base}{self.prefix}{path}", body, self.headers, self.timeout)
+        if status != 200:
+            raise RuntimeError(f"HTTP {status} on {self.prefix}{path}: {raw[:300].decode(errors='replace')}")
+        return json.loads(raw)
+
+    def get(self, path: str) -> dict | None:
+        status, raw = http("GET", f"{self.base}{self.prefix}{path}", None, self.headers, self.timeout)
+        if status != 200:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
+
+
+class Swap:
+    def __init__(self, base: str, key: str | None, timeout: float):
+        self.base = base
+        self.headers = {"Authorization": f"Bearer {key}"} if key else {}
+        self.timeout = timeout
+
+    def running(self) -> list[str]:
+        status, raw = http("GET", f"{self.base}/running", None, self.headers, 30)
+        if status == 401:
+            raise UserError("llama-swap rejected the API key (401) -- set LLAMA_SWAP_API_KEY")
+        if status != 200:
+            raise UserError(f"llama-swap /running -> HTTP {status}: {raw[:200].decode(errors='replace')}")
+        return [r["model"] for r in json.loads(raw).get("running", []) if r.get("state") != "stopped"]
+
+    def unload_model(self, model: str) -> bool:
+        status, _ = http("POST", f"{self.base}/api/models/unload/{model}", None, self.headers, 60)
+        return status == 200
+
+    def unload(self) -> None:
+        status, raw = http("GET", f"{self.base}/unload", None, self.headers, 120)
+        if status != 200:
+            raise UserError(f"/unload -> HTTP {status}: {raw[:200].decode(errors='replace')}")
+        for _ in range(60):
+            if not self.running():
+                time.sleep(2)  # let the driver free VRAM
+                return
+            time.sleep(1)
+        raise UserError("models still resident 60 s after /unload")
+
+    def upstream(self, key: str) -> Target:
+        return Target(self.base, f"/upstream/{key}", self.headers, key, self.timeout)
+
+    def openai(self, model: str) -> Target:
+        return Target(self.base, "", self.headers, model, self.timeout)
+
+
+class Guard:
+    """Keeps llama-swap free of everything but the model under test for the whole
+    run (see the docstring). allowed = set of model keys that may be resident."""
+
+    def __init__(self, swap: Swap | None, enabled: bool):
+        self.swap, self.enabled = swap, enabled and swap is not None
+        self.allowed: set[str] = set()
+        self.evicted: list[str] = []      # intruders seen since the last take()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        if self.enabled:
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self.enabled and self._thread.is_alive():
+            self._thread.join(5)
+
+    def allow(self, *models: str) -> None:
+        with self._lock:
+            self.allowed = set(models)
+
+    def take(self) -> list[str]:
+        with self._lock:
+            out, self.evicted = self.evicted, []
+        return out
+
+    def _run(self) -> None:
+        while not self._stop.wait(0.5):
+            try:
+                resident = self.swap.running()
+            except UserError:
+                continue
+            with self._lock:
+                intruders = [m for m in resident if m not in self.allowed]
+            for m in intruders:
+                warn(f"guard: evicting {m} (loaded by someone else during the benchmark)")
+                try:
+                    if not self.swap.unload_model(m):
+                        self.swap.unload()  # alias/unknown -> drop everything (allowed model reloads on demand)
+                except UserError:
+                    pass
+                with self._lock:
+                    self.evicted.append(m)
+
+
+def versions() -> dict[str, str]:
+    out = {}
+    try:
+        for line in open(VERSIONS):
+            k, _, v = line.partition(":")
+            if _:
+                out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+# ── host / GPU state ─────────────────────────────────────────────────────────
+def _sysfs_sum(name: str) -> int:
+    total = 0
+    for f in glob.glob(f"/sys/class/drm/card*/device/{name}"):
+        try:
+            total += int(open(f).read())
+        except (OSError, ValueError):
+            pass
+    return total
+
+
+def vram_mib() -> int:
+    return _sysfs_sum("mem_info_vram_used") >> 20
+
+
+def gtt_mib() -> int:
+    return _sysfs_sum("mem_info_gtt_used") >> 20
+
+
+def is_uma() -> bool:
+    """iGPU/APU heuristic: a 'VRAM' carve-out of <= 4 GiB means the real pool is GTT."""
+    totals = [int(open(f).read()) for f in glob.glob("/sys/class/drm/card*/device/mem_info_vram_total")
+              if os.path.exists(f)]
+    return bool(totals) and max(totals) <= (4 << 30)
+
+
+def load_notice() -> None:
+    try:
+        load1 = float(open("/proc/loadavg").read().split()[0])
+    except (OSError, ValueError):
+        return
+    if load1 > (os.cpu_count() or 1) / 2:
+        warn(f"box is not idle (loadavg {load1:.1f}) -- numbers may read low")
+
+
+def fmt_gib(mib: int) -> str:
+    return f"{mib / 1024:.1f}G"
+
+
+# ── presets ──────────────────────────────────────────────────────────────────
+PROSE_PROMPT = (
+    "The lighthouse keeper climbed the spiral staircase for the last time. "
+    "Below, the sea rehearsed its old argument with the rocks, and the lamp "
+    "room smelled of brass polish and burnt dust. He logged the wind speed, "
+    "the pressure, the visibility, and then, out of habit older than the "
+    "logbook itself, he pressed his palm against the cold glass and counted "
+    "the seconds between waves. Continue this story, describing what he sees "
+    "on the horizon, who he remembers, and why this night is different from "
+    "the ten thousand nights before it. Take your time and do not stop."
+)
+JSON_PROMPT = (
+    "Produce a JSON array of 60 objects describing fictional European train "
+    "stations. Every object must have exactly these keys in this order: "
+    "\"id\" (integer from 1), \"name\", \"city\", \"country\", \"platforms\" "
+    "(integer), \"opened\" (year), \"electrified\" (boolean). Output only the "
+    "JSON, pretty-printed with two-space indentation, no commentary."
+)
+
+
+def refactor_module(n_funcs: int = 12) -> str:
+    """Deterministic ~150-line module; the task is a mechanical rename, so a
+    correct answer copies almost every token from the prompt (MTP upper bound)."""
+    out = ["import logging", "", "", "DEFAULTS = {\"scale\": 1.0, \"offset\": 0.0}", "", ""]
+    for i in range(n_funcs):
+        out.append(f'''def process_record_{i}(record, config, logger):
+    """Validate and normalise record type {i} according to config."""
+    if record is None:
+        logger.warning("record {i} is None, skipping")
+        return None
+    value = record.get("value_{i}", 0)
+    scale = config.get("scale_{i}", DEFAULTS["scale"])
+    offset = config.get("offset_{i}", DEFAULTS["offset"])
+    result = value * scale + offset
+    if result < config.get("min_{i}", -1e9):
+        logger.info("record {i} clamped at lower bound")
+        result = config.get("min_{i}")
+    if result > config.get("max_{i}", 1e9):
+        logger.info("record {i} clamped at upper bound")
+        result = config.get("max_{i}")
+    record["normalised_{i}"] = result
+    return record
+
+''')
+    return "\n".join(out)
+
+
+REFACTOR_MESSAGES = [
+    {"role": "system", "content": "You are a precise code editor. Reply with code only, no commentary."},
+    {"role": "user", "content": (
+        "Here is a Python module:\n\n```python\n" + refactor_module() + "```\n\n"
+        "Rename the parameter `logger` to `log` in EVERY function, including all uses inside "
+        "the bodies. Do not change anything else. Reply with the complete modified module in a "
+        "single python code block.")},
+]
+
+AGENT_TOOLS = [
+    {"type": "function", "function": {"name": "read_file", "description": "Read a UTF-8 text file from the workspace.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Overwrite a file with new content.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "list_dir", "description": "List a directory (non-recursive).",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "run_command", "description": "Run a shell command in the workspace and return stdout+stderr.",
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout_s": {"type": "integer"}},
+                    "required": ["command"]}}},
+    {"type": "function", "function": {"name": "search_code", "description": "Regex search across the workspace.",
+     "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "glob": {"type": "string"}},
+                    "required": ["pattern"]}}},
+    {"type": "function", "function": {"name": "http_get", "description": "Fetch a URL and return the body as text.",
+     "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
+]
+
+_AGENT_FILE = '''"""Inventory pricing helpers."""
+from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
+
+TAX_RATES = {"PL": Decimal("0.23"), "DE": Decimal("0.19"), "CZ": Decimal("0.21")}
+
+
+@dataclass
+class Item:
+    sku: str
+    name: str
+    net_price: Decimal
+    quantity: int
+    country: str = "PL"
+
+
+def gross_price(item: Item) -> Decimal:
+    rate = TAX_RATES[item.country]
+    gross = item.net_price * (1 + rate)
+    return gross.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def line_total(item: Item) -> Decimal:
+    return gross_price(item) * item.quantity
+
+
+def apply_discount(total: Decimal, percent: int) -> Decimal:
+    if percent < 0 or percent > 100:
+        raise ValueError("percent out of range")
+    factor = Decimal(100 - percent) / Decimal(100)
+    return (total * factor).quantize(Decimal("0.01"))
+
+
+def basket_total(items: list[Item], discount_percent: int = 0) -> Decimal:
+    subtotal = sum(line_total(i) for i in items)
+    return apply_discount(subtotal, discount_percent)
+
+
+def cheapest(items: list[Item]) -> Item:
+    return min(items, key=lambda i: i.net_price)
+
+
+def restock_needed(items: list[Item], threshold: int = 5) -> list[str]:
+    return [i.sku for i in items if i.quantity <= threshold]
+
+
+def format_receipt(items: list[Item]) -> str:
+    lines = [f"{i.sku:<10} {i.name:<24} {i.quantity:>4} x {gross_price(i):>8} = {line_total(i):>9}"
+             for i in items]
+    lines.append("-" * 60)
+    lines.append(f"{'TOTAL':<41} {basket_total(items):>18}")
+    return "\\n".join(lines)
+'''
+
+_AGENT_TRACEBACK = '''============================= test session starts ==============================
+collected 6 items
+
+tests/test_pricing.py ..F..F                                             [100%]
+
+=================================== FAILURES ===================================
+_____________________________ test_basket_total_empty _____________________________
+    def test_basket_total_empty():
+>       assert basket_total([]) == Decimal("0.00")
+E       TypeError: unsupported operand type(s) for *: 'int' and 'decimal.Decimal'
+pricing.py:33: in basket_total
+    subtotal = sum(line_total(i) for i in items)
+___________________________ test_apply_discount_rounding ___________________________
+    def test_apply_discount_rounding():
+>       assert apply_discount(Decimal("10.005"), 0) == Decimal("10.01")
+E       AssertionError: assert Decimal('10.00') == Decimal('10.01')
+========================= 2 failed, 4 passed in 0.11s ==========================
+'''
+
+AGENT_MESSAGES = [
+    {"role": "system", "content": (
+        "You are an autonomous coding agent working in a Python repository. Use the provided "
+        "tools to inspect and change the code. Think briefly, then act. When you edit a file, "
+        "call write_file with the COMPLETE new content.")},
+    {"role": "user", "content": "The pricing tests fail in CI. Find out why and fix pricing.py."},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call_1", "type": "function", "function": {"name": "list_dir", "arguments": "{\"path\": \".\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_1", "content":
+        "README.md\npricing.py\npyproject.toml\ntests/\ntests/test_pricing.py\n.github/workflows/ci.yml"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call_2", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"pricing.py\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_2", "content": _AGENT_FILE},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call_3", "type": "function", "function": {"name": "run_command",
+                                                          "arguments": "{\"command\": \"python -m pytest -q\", \"timeout_s\": 120}"}}]},
+    {"role": "tool", "tool_call_id": "call_3", "content": _AGENT_TRACEBACK},
+    {"role": "user", "content": "Go ahead and fix both failures."},
+]
+
+TOOLS_TOOL = [{"type": "function", "function": {
+    "name": "get_weather",
+    "description": "Get the current weather for a city.",
+    "parameters": {"type": "object",
+                   "properties": {"city": {"type": "string", "description": "City name"},
+                                  "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}},
+                   "required": ["city"]}}}]
+TOOLS_MESSAGES = [
+    {"role": "system", "content": "You are a helpful assistant with tools. Use a tool when it answers the question."},
+    {"role": "user", "content": "What is the weather in Krakow right now, in celsius?"},
+]
+
+REASONING_MESSAGES = [
+    {"role": "user", "content": (
+        "Five houses in a row are painted red, blue, green, yellow and white, each a different "
+        "colour. The red house is immediately left of the blue one. The green house is not at "
+        "either end. The white house is somewhere to the right of the yellow one, and the yellow "
+        "house is not next to the green one. The blue house is at one end. Give the order from "
+        "left to right and explain your reasoning step by step.")},
+]
+
+_WORDS = ("harbour lantern granite ledger monsoon copper orchard velvet quarry saffron meridian "
+          "pilgrim tundra anvil cedar compass ember fjord glacier hollow ivory jasper kestrel "
+          "lattice marrow nectar obsidian pewter quill raven sable talon umber vessel willow "
+          "yarrow zephyr archive basalt cistern dune estuary furrow gable hearth isthmus juniper "
+          "kiln loom mantle nomad oasis parapet quay reef sextant tallow undertow vellum wharf").split()
+
+
+def prefill_prompt(n_tokens: int, seed: int = 7) -> str:
+    """Seeded pseudo-random prose, ~3.6 chars/token on Qwen-class tokenizers, with
+    no repeated passages (so nothing for prompt caching or ngram drafts to reuse)."""
+    rng = random.Random(seed)
+    target = int(n_tokens * 3.6)
+    out, size = [], 0
+    while size < target:
+        n = rng.randint(7, 16)
+        words = [rng.choice(_WORDS) for _ in range(n)]
+        if rng.random() < 0.3:
+            words.insert(rng.randint(1, n - 1), str(rng.randint(3, 9999)))
+        s = " ".join(words).capitalize() + rng.choice([". ", ". ", ", ", "; ", ".\n"])
+        out.append(s)
+        size += len(s)
+    return ("Read the following log carefully and then answer: which word occurs first?\n\n"
+            + "".join(out) + "\nAnswer:")
+
+
+@dataclass
+class Preset:
+    name: str
+    kind: str                 # completion | chat
+    n_predict: int
+    fixed_len: bool
+    note: str
+
+    def body(self, model: str, entry: Entry, opts: argparse.Namespace) -> dict:
+        n_predict = opts.n_predict or self.n_predict
+        common = {"n_predict": n_predict, "ignore_eos": self.fixed_len, "cache_prompt": False, "id_slot": 0}
+        if self.name in ("prose", "json", "prefill"):
+            if self.name == "prefill":
+                n = opts.prefill_tokens
+                if entry.ctx and n > entry.ctx - 1024:
+                    n = entry.ctx - 1024
+                    warn(f"{entry.key}: prefill capped to {n} tokens (ctx {entry.ctx})")
+                prompt = prefill_prompt(n)
+            else:
+                prompt = PROSE_PROMPT if self.name == "prose" else JSON_PROMPT
+            return {"prompt": prompt, **common}
+        body = {"model": model, "stream": False, **common}
+        if self.name == "refactor":
+            body["messages"] = REFACTOR_MESSAGES
+        elif self.name == "agent":
+            body["messages"] = AGENT_MESSAGES
+            body["tools"] = AGENT_TOOLS
+            body["tool_choice"] = "auto"
+        elif self.name == "tools":
+            body["messages"] = TOOLS_MESSAGES
+            body["tools"] = TOOLS_TOOL
+            body["tool_choice"] = "auto"
+        elif self.name == "reasoning":
+            body["messages"] = REASONING_MESSAGES
+            body["chat_template_kwargs"] = {"enable_thinking": True}
+            body["reasoning_format"] = "deepseek"
+        return body
+
+
+PRESETS: dict[str, Preset] = {p.name: p for p in [
+    Preset("prose", "completion", 512, True, "free prose -- speculative worst case"),
+    Preset("json", "completion", 512, True, "structured JSON -- speculative best case"),
+    Preset("refactor", "chat", 1024, True, "copy-heavy code edit (~2k-token module, mechanical rename)"),
+    Preset("agent", "chat", 256, True, "agentic tool-calling transcript (~2.5k prompt tokens, 6 tools)"),
+    Preset("tools", "chat", 256, False, "single tool call, natural stop; col: call/finish"),
+    Preset("reasoning", "chat", 512, True, "enable_thinking on; col: think"),
+    Preset("prefill", "completion", 16, True, "pure big-context prefill (--prefill-tokens, default 32768)"),
+]}
+
+
+def parse_presets(spec: str) -> list[Preset]:
+    if spec == "all":
+        return list(PRESETS.values())
+    out = []
+    for name in spec.split(","):
+        name = PROMPT_ALIASES.get(name.strip(), name.strip())
+        if name not in PRESETS:
+            raise UserError(f"unknown preset '{name}' (have: {', '.join(PRESETS)}, all)")
+        out.append(PRESETS[name])
+    return out
+
+
+# ── rows / printers ──────────────────────────────────────────────────────────
+@dataclass
+class Row:
+    model: str
+    preset: str
+    params: str
+    pp: float | None = None
+    tg: float | None = None
+    tok: int | None = None
+    accept: str = "-"
+    vram: int | None = None
+    gtt: int | None = None
+    hash: str = "-"
+    extra: dict = field(default_factory=dict)
+    flags: list[str] = field(default_factory=list)
+    error: str | None = None
+    kernel: dict = field(default_factory=dict)   # kernel-mode columns
+
+
+def _num(v: float | None, prec: int = 1) -> str:
+    return "-" if v is None else f"{v:.{prec}f}"
+
+
+class TablePrinter:
+    """Fixed-width table printed incrementally (header once, one line per row as
+    results arrive -- a full sweep takes many minutes)."""
+
+    SERVER = [("model", 14, "l"), ("preset", 9, "l"), ("params", 44, "l"), ("pp t/s", 7, "r"),
+              ("tg t/s", 7, "r"), ("tok", 6, "r"), ("accept", 6, "r"), ("vram", 6, "r"),
+              ("gtt", 5, "r"), ("hash", 12, "l"), ("notes", 0, "l")]
+    KERNEL = [("model", 14, "l"), ("variant", 8, "l"), ("params", 44, "l"), ("pp512", 14, "r"),
+              ("tg128", 12, "r"), ("pp512@8k", 14, "r"), ("tg128@8k", 12, "r"), ("build", 16, "l"),
+              ("notes", 0, "l")]
+
+    def __init__(self, kernel: bool, enabled: bool = True):
+        self.cols = self.KERNEL if kernel else self.SERVER
+        self.kernel = kernel
+        self.enabled = enabled
+
+    def _line(self, cells: list[str]) -> str:
+        out = []
+        for (name, w, align), c in zip(self.cols, cells):
+            if w == 0:
+                out.append(c)
+            else:
+                out.append(c.rjust(w) if align == "r" else c.ljust(w))
+        return "  ".join(out).rstrip()
+
+    def header(self) -> None:
+        if self.enabled:
+            print(self._line([c[0] for c in self.cols]), flush=True)
+
+    def row(self, r: Row) -> None:
+        if not self.enabled:
+            return
+        if r.error:
+            notes = f"FAILED: {r.error}"
+        else:
+            notes = " ".join([f"{k}={v}" for k, v in r.extra.items()] + r.flags)
+        if self.kernel:
+            k = r.kernel
+            cells = [r.model, k.get("variant", "-"), r.params, k.get("pp512", "-"), k.get("tg128", "-"),
+                     k.get("pp512@8k", "-"), k.get("tg128@8k", "-"), k.get("build", "-"), notes]
+        else:
+            cells = [r.model, r.preset, r.params, _num(r.pp), _num(r.tg),
+                     "-" if r.tok is None else str(r.tok), r.accept,
+                     "-" if r.vram is None else fmt_gib(r.vram),
+                     "-" if r.gtt is None else fmt_gib(r.gtt), r.hash, notes]
+        print(self._line(cells), flush=True)
+
+
+def print_md(rows: list[Row], kernel: bool, today: str) -> None:
+    if kernel:
+        print("| Date | Model / entry | Config under test | Result | Why / notes |")
+        print("|---|---|---|---|---|")
+        for r in rows:
+            k = r.kernel
+            res = (f"pp512 **{k.get('pp512', '-')}**, tg128 **{k.get('tg128', '-')}**, "
+                   f"pp512@8k {k.get('pp512@8k', '-')}, tg128@8k {k.get('tg128@8k', '-')}")
+            print(f"| {today} | `{r.model}` | llama-bench {k.get('variant', '')} `{k.get('cmd', '')}` "
+                  f"({r.params}) | {res} | build {k.get('build', '?')} {' '.join(r.flags)} |")
+        return
+    print("| Date | Model / entry | Config under test | Result | Why / notes |")
+    print("|---|---|---|---|---|")
+    for r in rows:
+        if r.error:
+            print(f"| {today} | `{r.model}` | {r.preset} ({r.params}) | FAILED: {r.error} | |")
+            continue
+        res = (f"pp **{_num(r.pp)}** / tg **{_num(r.tg)}** t/s, {r.tok} tok, accept {r.accept}, "
+               f"vram {fmt_gib(r.vram or 0)}, gtt {fmt_gib(r.gtt or 0)}, hash `{r.hash}`")
+        notes = " ".join([f"{k}={v}" for k, v in r.extra.items()] + r.flags)
+        print(f"| {today} | `{r.model}` | benchmark `{r.preset}` greedy ({r.params}) | {res} | {notes} |")
+
+
+def print_json(rows: list[Row], meta: dict) -> None:
+    def enc(r: Row) -> dict:
+        d = r.__dict__.copy()
+        return d
+    print(json.dumps({"meta": meta, "rows": [enc(r) for r in rows]}, indent=1))
+
+
+# ── server-level runner ──────────────────────────────────────────────────────
+_METRICS = ("llamacpp:prompt_tokens_total", "llamacpp:tokens_predicted_total")
+
+
+def token_counters(target: Target | None) -> tuple[int, int] | None:
+    """llama-server's Prometheus counters (needs --metrics on the entry); None if unavailable."""
+    if target is None:
+        return None
+    status, raw = http("GET", f"{target.base}{target.prefix}/metrics", None, target.headers, 30)
+    if status != 200:
+        return None
+    vals = {}
+    for line in raw.decode(errors="replace").splitlines():
+        for name in _METRICS:
+            if line.startswith(name + " "):
+                try:
+                    vals[name] = int(float(line.split()[1]))
+                except (ValueError, IndexError):
+                    pass
+    if len(vals) != 2:
+        return None
+    return vals[_METRICS[0]], vals[_METRICS[1]]
+
+
+def measure(target: Target, entry: Entry, preset: Preset, opts: argparse.Namespace,
+            sampled: bool) -> tuple[dict, str, dict]:
+    """One measured request -> (timings, hash, extras)."""
+    body = preset.body(target.model, entry, opts)
+    extras: dict = {}
+    if sampled:
+        # production sampling through llama-swap's filtered OpenAI route
+        if "prompt" in body:
+            body = {"model": target.model, "stream": False,
+                    "messages": [{"role": "user", "content": body.pop("prompt")}],
+                    **{k: v for k, v in body.items() if k not in ("prompt",)}}
+        d = target.post("/v1/chat/completions", body)
+        msg = d["choices"][0]["message"]
+        h = "-"
+    elif preset.kind == "completion":
+        body.update(GREEDY)
+        d = target.post("/completion", body)
+        h = hashlib.sha256((d.get("content") or "").encode()).hexdigest()[:12]
+        msg = None
+    else:
+        body.update(GREEDY)
+        d = target.post("/v1/chat/completions", body)
+        msg = d["choices"][0]["message"]
+        h = hashlib.sha256(json.dumps(msg, sort_keys=True).encode()).hexdigest()[:12]
+    if msg is not None:
+        if preset.name in ("agent", "tools"):
+            extras["call"] = "yes" if msg.get("tool_calls") else "no"
+        if preset.name == "tools":
+            extras["finish"] = d["choices"][0].get("finish_reason", "?")
+        if preset.name == "reasoning":
+            extras["think"] = "yes" if (msg.get("reasoning_content") or "").strip() else "no"
+    t = d.get("timings") or {}
+    if preset.name == "prefill":
+        extras["ttft"] = f"{t.get('prompt_ms', 0) / 1000:.1f}s"
+    return t, h, extras
+
+
+def warmup(target: Target, sampled: bool) -> None:
+    """Swap-load the model and warm it up; never measured. Two prompt sizes so both
+    the small-batch and the full-ubatch prefill paths have run once (the first
+    prefill of a new shape reads 2-3x slow on Vulkan)."""
+    for prompt in (PROSE_PROMPT, prefill_prompt(700)):
+        if sampled:  # llama-swap's own routes: only the OpenAI surface exists there
+            target.post("/v1/chat/completions", {"model": target.model, "stream": False,
+                                                 "messages": [{"role": "user", "content": prompt}],
+                                                 "max_tokens": N_WARMUP, "cache_prompt": False, "id_slot": 0})
+        else:
+            target.post("/completion", {"prompt": prompt, "n_predict": N_WARMUP, "cache_prompt": False, **GREEDY})
+
+
+def preset_warmup(target: Target, entry: Entry, preset: Preset, opts: argparse.Namespace, sampled: bool) -> None:
+    """A 16-token dry run of the preset's own request (the old bench-models did this:
+    it primes the exact prefill shape and the draft model's state). Skipped for
+    prefill, whose whole point is the cold full-length prompt."""
+    if preset.name == "prefill":
+        return
+    body = preset.body(target.model, entry, opts)
+    body["n_predict"] = N_WARMUP
+    body["ignore_eos"] = True
+    if sampled:
+        if "prompt" in body:
+            body = {"model": target.model, "stream": False,
+                    "messages": [{"role": "user", "content": body.pop("prompt")}], **body}
+        target.post("/v1/chat/completions", body)
+    elif preset.kind == "completion":
+        target.post("/completion", {**body, **GREEDY})
+    else:
+        target.post("/v1/chat/completions", {**body, **GREEDY})
+
+
+def bench_server(target: Target, entry: Entry, presets: list[Preset], opts: argparse.Namespace,
+                 sampled: bool, params_extra: str | None, baseline_gtt: int, uma: bool,
+                 emit, guard: Guard, metrics_target: Target | None) -> list[Row]:
+    rows: list[Row] = []
+    params = entry.params(params_extra)
+    try:
+        warmup(target, sampled)
+    except Exception as ex:  # load failure: one FAILED row for the whole model
+        rows = [Row(target.model, p.name, params, error=str(ex)) for p in presets]
+        for r in rows:
+            emit(r)
+        return rows
+    for p in presets:
+        row = Row(target.model, p.name, params)
+        try:
+            preset_warmup(target, entry, p, opts, sampled)
+            before = token_counters(metrics_target)
+            runs = [measure(target, entry, p, opts, sampled) for _ in range(max(1, opts.repeat))]
+            after = token_counters(metrics_target)
+            t = runs[0][0]
+            if before and after:   # anyone else on this server while we measured?
+                ours_p = sum(r[0].get("prompt_n", 0) for r in runs)
+                ours_g = sum(r[0].get("predicted_n", 0) for r in runs)
+                if (after[0] - before[0] - ours_p) > 32 or (after[1] - before[1] - ours_g) > 32:
+                    row.flags.append("SHARED")
+            row.pp = statistics.median(r[0].get("prompt_per_second", 0) for r in runs)
+            if p.name == "prefill":
+                row.tg = None
+                row.tok = t.get("prompt_n")
+            else:
+                row.tg = statistics.median(r[0].get("predicted_per_second", 0) for r in runs)
+                row.tok = t.get("predicted_n")
+            drafted = t.get("draft_n") or 0
+            row.accept = f"{100 * t.get('draft_n_accepted', 0) / drafted:.0f}%" if drafted else "-"
+            row.hash = runs[0][1]   # first run only -- see the docstring on hashes
+            row.extra = runs[0][2]
+            row.vram, row.gtt = vram_mib(), gtt_mib()
+            if (not uma and opts.spill_threshold and entry.ngl == "all" and entry.fit != "on"
+                    and row.gtt - baseline_gtt > opts.spill_threshold):
+                row.flags.append("SPILL")
+        except Exception as ex:
+            row.error = str(ex)
+        ev = guard.take()
+        if ev:
+            row.flags.append(f"EVICTED:{len(ev)}")
+        rows.append(row)
+        emit(row)
+    return rows
+
+
+# ── kernel-level runner ──────────────────────────────────────────────────────
+def kernel_argv(entry: Entry, gguf: str, opts: argparse.Namespace, binary: str) -> list[str]:
+    argv = [binary, "-m", gguf]
+    if opts.std:
+        argv += STANDARD_BENCH
+    else:
+        argv += ["-fa", "1", "-ctk", entry.ctk, "-ctv", entry.ctv,
+                 "-b", str(entry.batch or 2048), "-ub", str(entry.ubatch or 512), "-p", "512", "-n", "128"]
+        depth = opts.depth or ("0" if entry.ngl == "0" else "0,8192")
+        argv += ["-d", depth]
+        if entry.ngl not in (None, "all"):
+            argv += ["-ngl", entry.ngl]
+        if entry.fit == "on":
+            argv += ["-fitt", str(FIT_MARGIN_MIB)]
+        if entry.threads:
+            argv += ["-t", str(entry.threads)]
+        if entry.n_cpu_moe:
+            argv += ["-ncmoe", str(entry.n_cpu_moe)]
+        if entry.lazy_mode and entry.lazy_mode.startswith("on"):
+            argv += ["-lzm", "on"]
+    argv += ["-r", str(opts.reps), "--progress", "-o", "json"]
+    if opts.bench_args:
+        argv += shlex.split(opts.bench_args)
+    return argv
+
+
+def bench_kernel(entry: Entry, opts: argparse.Namespace, variant: str, swap: Swap | None, guard: Guard) -> Row:
+    binary = "llama-bench" + ("" if variant == "vulkan" else f"-{variant}")
+    row = Row(entry.key, "kernel", entry.params(), kernel={"variant": variant})
+    if not shutil.which(binary):
+        have = sorted(os.path.basename(p) for d in os.environ["PATH"].split(":")
+                      for p in glob.glob(os.path.join(d, "llama-bench*")))
+        row.error = f"{binary} not in this image (have: {', '.join(have) or 'none'}; -rocm/-engram only in the :rocm tag)"
+        return row
+    try:
+        gguf = resolve_gguf(entry)
+    except UserError as ex:
+        row.error = str(ex)
+        return row
+    argv = kernel_argv(entry, gguf, opts, binary)
+    row.kernel["cmd"] = " ".join(shlex.quote(a) for a in argv[1:])
+    print(f"+ {' '.join(shlex.quote(a) for a in argv)}", file=sys.stderr, flush=True)
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=None, timeout=opts.timeout * 4, check=False)
+    except subprocess.TimeoutExpired:
+        row.error = "llama-bench timed out"
+        return row
+    if proc.returncode != 0:
+        row.error = f"llama-bench exit {proc.returncode}"
+        return row
+    try:
+        results = json.loads(proc.stdout.decode() or "[]")
+    except ValueError:
+        row.error = "llama-bench printed no JSON"
+        return row
+    for r in results:
+        label = f"pp{r['n_prompt']}" if r.get("n_prompt") else f"tg{r['n_gen']}"
+        if r.get("n_depth"):
+            label += f"@{r['n_depth'] // 1024}k"
+        row.kernel[label] = f"{r['avg_ts']:.1f}±{r['stddev_ts']:.1f}"
+        row.kernel["build"] = f"{r.get('build_number', '')} {r.get('build_commit', '')}".strip()
+        row.kernel["model_type"] = r.get("model_type")
+        row.kernel["file"] = os.path.basename(r.get("model_filename", gguf))
+    ev = guard.take()
+    if ev:
+        row.flags.append(f"EVICTED:{len(ev)}")
+    elif swap:
+        try:
+            if swap.running():
+                row.flags.append("CONTAMINATED")
+        except UserError:
+            pass
+    return row
+
+
+# ── standalone runner ────────────────────────────────────────────────────────
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def standalone_argv(entry: Entry, variant: str, port: int) -> list[str]:
+    binary = "llama-server" + ("" if variant == "vulkan" else f"-{variant}")
+    argv = [binary] + list(entry.argv[1:])   # ${PORT} was replaced by "0" at parse time
+    for flag, value in (("--host", "127.0.0.1"), ("--port", str(port))):
+        if flag in argv:
+            argv[argv.index(flag) + 1] = value
+        else:
+            argv += [flag, value]
+    return argv
+
+
+class Standalone:
+    def __init__(self, entry: Entry, variant: str, timeout: float):
+        self.entry, self.variant, self.timeout = entry, variant, timeout
+        self.port = free_port()
+        self.proc: subprocess.Popen | None = None
+        self.log = open(f"/tmp/benchmark-{entry.key}-{variant}.log", "wb")
+
+    def __enter__(self) -> Target:
+        argv = standalone_argv(self.entry, self.variant, self.port)
+        if not shutil.which(argv[0]):
+            raise UserError(f"{argv[0]} not in this image")
+        print(f"+ {' '.join(shlex.quote(a) for a in argv)}", file=sys.stderr, flush=True)
+        self.proc = subprocess.Popen(argv, stdout=self.log, stderr=subprocess.STDOUT)
+        deadline = time.time() + max(self.entry.health_timeout, 60)
+        base = f"http://127.0.0.1:{self.port}"
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                self.log.flush()
+                tail = open(self.log.name, "rb").read()[-2000:].decode(errors="replace")
+                raise RuntimeError(f"{argv[0]} exited with {self.proc.returncode}:\n{tail}")
+            try:
+                status, _ = http("GET", f"{base}/health", None, {}, 5)
+                if status == 200:
+                    return Target(base, "", {}, self.entry.key, self.timeout)
+            except (urllib.error.URLError, OSError, ConnectionError):
+                pass
+            time.sleep(1)
+        raise RuntimeError(f"{argv[0]} did not become healthy within {self.entry.health_timeout}s "
+                           f"(log: {self.log.name})")
+
+    def __exit__(self, *exc) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        self.log.close()
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="benchmark", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Benchmark llama-swap text entries (server-level), their GGUFs (llama-bench) "
+                    "or a standalone llama-server variant.",
+        epilog="presets:\n" + "\n".join(f"  {n:<10} {p.note}" for n, p in PRESETS.items())
+               + "\n\nexamples:\n  benchmark qwen38                      # all presets, via llama-swap\n"
+                 "  benchmark --prompt prose,json qwen38 qwen38-hh\n"
+                 "  benchmark --kernel --std --unload qwen38\n"
+                 "  benchmark --standalone --variant rocm --unload qwen38\n"
+                 "  benchmark --sampled qwen38:l\n  benchmark --list")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--kernel", action="store_true", help="llama-bench on the entry's GGUF (hardware/build number)")
+    mode.add_argument("--standalone", action="store_true", help="spawn llama-server-<variant> with the entry's cmd")
+    mode.add_argument("--sampled", action="store_true", help="via llama-swap /v1/chat/completions with filters (production sampling)")
+    mode.add_argument("--list", action="store_true", help="list parsed llama-server entries, no requests")
+    p.add_argument("--variant", choices=VARIANTS, help="llama.cpp build to use (--kernel/--standalone); default = the entry's binary")
+    p.add_argument("--prompt", default="all", help="comma-separated presets or 'all' (default all)")
+    p.add_argument("--prefill-tokens", type=int, default=32768, help="prefill preset size (capped to ctx-1024)")
+    p.add_argument("--n-predict", type=int, help="override every preset's generated token count")
+    p.add_argument("--repeat", type=int, default=1, help="measured runs per preset (median of t/s; hash from the first run)")
+    p.add_argument("--format", choices=("table", "md", "json"), default="table")
+    p.add_argument("--unload", action="store_true", help="GET /unload first (required for --kernel/--standalone when models are resident)")
+    p.add_argument("--no-guard", action="store_true", help="do not evict models other services load during the run (default: evict + flag EVICTED)")
+    p.add_argument("--spill-threshold", type=int, default=1536, help="MiB of gtt growth that flags SPILL (0 = off)")
+    p.add_argument("--timeout", type=float, default=1200, help="per-request timeout in seconds (model load included)")
+    p.add_argument("--config", default=CONFIG)
+    p.add_argument("--base", default=BASE, help="llama-swap URL")
+    p.add_argument("--std", action="store_true", help="--kernel: use the fixed community-comparable llama-bench line")
+    p.add_argument("--depth", help="--kernel: -d list (default 0,8192; 0 for CPU entries)")
+    p.add_argument("--reps", type=int, default=5, help="--kernel: llama-bench -r")
+    p.add_argument("--bench-args", help="--kernel: extra llama-bench args, verbatim")
+    p.add_argument("models", nargs="*", help="entry keys (default: every listed text entry)")
+    return p
+
+
+def cmd_list(cfg: Config) -> None:
+    rows = []
+    for e in cfg.llama_entries():
+        rows.append([e.key, e.variant, ",".join(e.groups) or "-", e.params(),
+                     f"{'+'.join(e.caps_in) or '-'}->{'+'.join(e.caps_out) or '-'}",
+                     "unlisted" if e.unlisted else ("text" if e.is_text else "-"),
+                     ",".join(e.tier_ids + e.aliases) or "-"])
+    hdr = ["model", "variant", "group", "params", "caps", "bench", "aliases"]
+    widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(hdr)]
+    print("  ".join(h.ljust(w) for h, w in zip(hdr, widths)))
+    for r in rows:
+        print("  ".join(c.ljust(w) for c, w in zip(r, widths)))
+    print(f"\n{len(rows)} llama-server entries; 'bench'=text are the default sweep. "
+          f"peers: {', '.join(cfg.peers) or 'none'}")
+
+
+def main() -> int:
+    opts = build_parser().parse_args()
+    if opts.variant and not (opts.kernel or opts.standalone):
+        raise UserError("--variant only applies to --kernel / --standalone")
+    cfg = Config(opts.config)
+    if opts.list:
+        cmd_list(cfg)
+        return 0
+    presets = parse_presets(opts.prompt)
+    key = os.environ.get("LLAMA_SWAP_API_KEY")
+    swap = Swap(opts.base, key, opts.timeout)
+    try:
+        resident = swap.running()
+    except UserError as ex:
+        if opts.kernel or opts.standalone:
+            warn(f"{ex}; continuing without llama-swap coordination")
+            swap, resident = None, []
+        else:
+            raise
+    load_notice()
+    if opts.unload and swap and resident:
+        warn(f"unloading {', '.join(resident)}")
+        swap.unload()
+        resident = []
+    if (opts.kernel or opts.standalone) and resident:
+        raise UserError(f"models resident in llama-swap ({', '.join(resident)}); pass --unload "
+                        f"or wait -- the GPU must be free for this mode")
+    if resident and not (opts.kernel or opts.standalone):
+        warn(f"already resident: {', '.join(resident)} (gtt baseline includes them)")
+    guard = Guard(swap, enabled=not opts.no_guard)
+    baseline_gtt, uma = gtt_mib(), is_uma()
+    if uma:
+        warn("UMA GPU detected: gtt is the normal memory pool, SPILL check disabled")
+
+    # model selection
+    targets: list[tuple[Entry, str]] = []
+    if opts.models:
+        for name in opts.models:
+            targets.append(cfg.resolve(name, opts.sampled))
+    else:
+        targets = [(e, e.key) for e in cfg.text_entries()]
+    if not targets:
+        raise UserError("no text entries found")
+
+    today = _dt.date.today().isoformat()
+    ver = versions()
+    mode = "kernel" if opts.kernel else "standalone" if opts.standalone else "sampled" if opts.sampled else "server"
+    meta = {"date": today, "mode": mode, "presets": [p.name for p in presets], "repeat": opts.repeat,
+            "n_predict": opts.n_predict, "prefill_tokens": opts.prefill_tokens,
+            "llama_vulkan_commit": ver.get("llama_vulkan_commit", "?").split()[0],
+            "llama_qwen4exp_commit": ver.get("llama_qwen4exp_commit", "?").split()[0],
+            "llama_swap": ver.get("llama-swap", "?"), "models": [t[0].key for t in targets]}
+    table = TablePrinter(kernel=opts.kernel, enabled=(opts.format == "table"))
+    if opts.format == "table":
+        print(f"benchmark {today} mode={mode} presets={','.join(meta['presets'])} repeat={opts.repeat} "
+              f"llama.cpp={meta['llama_vulkan_commit'][:8]}"
+              + (f" qwen4exp={meta['llama_qwen4exp_commit'][:8]}" if meta['llama_qwen4exp_commit'] != '?' else "")
+              + (" SAMPLED -- not comparable with greedy rows" if opts.sampled else "") + "\n", flush=True)
+        table.header()
+
+    rows: list[Row] = []
+    guard.start()
+    for entry, model in targets:
+        variant = opts.variant or entry.variant
+        guard.allow(*([] if (opts.kernel or opts.standalone) else [entry.key]))
+        if opts.kernel:
+            row = bench_kernel(entry, opts, variant, swap, guard)
+            rows.append(row)
+            table.row(row)
+            continue
+        if opts.standalone:
+            new: list[Row] = []
+            try:
+                with Standalone(entry, variant, opts.timeout) as tgt:
+                    new = bench_server(tgt, entry, presets, opts, False, f"variant={variant}",
+                                       baseline_gtt, uma, emit=lambda r: None, guard=guard, metrics_target=tgt)
+            except (UserError, RuntimeError) as ex:
+                new = [Row(entry.key, p.name, entry.params(f"variant={variant}"), error=str(ex)) for p in presets]
+            if swap and not guard.enabled:
+                try:
+                    if swap.running():
+                        for r in new:
+                            r.flags.append("CONTAMINATED")
+                except UserError:
+                    pass
+            for r in new:   # printed after teardown so CONTAMINATED can be included
+                table.row(r)
+            rows += new
+            continue
+        tgt = swap.openai(model) if opts.sampled else swap.upstream(entry.key)
+        rows += bench_server(tgt, entry, presets, opts, opts.sampled, None, baseline_gtt, uma,
+                             emit=table.row, guard=guard, metrics_target=swap.upstream(entry.key))
+    guard.stop()
+
+    if opts.format == "md":
+        print_md(rows, opts.kernel, today)
+    elif opts.format == "json":
+        print_json(rows, meta)
+    failed = [r for r in rows if r.error]
+    flagged = [r for r in rows if r.flags]
+    if failed or flagged:
+        print(file=sys.stderr)
+        for r in failed:
+            warn(f"{r.model}/{r.preset} FAILED: {r.error}")
+        for r in flagged:
+            warn(f"{r.model}/{r.preset}: {' '.join(r.flags)}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except UserError as ex:
+        print(f"benchmark: {ex}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)

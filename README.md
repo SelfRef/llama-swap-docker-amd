@@ -14,11 +14,12 @@
 |---|---|---|
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | `llama-server`, `llama-cli`, `llama-tts`, `llama-bench` | `llama-server-rocm`, `llama-cli-rocm`, `llama-tts-rocm`, `llama-bench-rocm` |
 | [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp) (llama.cpp fork, Strix Halo/qwen4exp) | — (fork is ROCm/HIP-only) | `llama-server-engram`, `llama-cli-engram`, `llama-bench-engram` (gfx1151 only) |
-| llama.cpp + open qwen4exp PRs (MTP for Qwen3.8-Flash-Next) | `llama-server-qwen4exp` (all tags, `WITH_QWEN4EXP`) | — (use `*-engram` on Strix Halo) |
+| llama.cpp + open qwen4exp PRs (MTP for Qwen3.8-Flash-Next) | `llama-server-qwen4exp`, `llama-bench-qwen4exp` (all tags, `WITH_QWEN4EXP`) | — (use `*-engram` on Strix Halo) |
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | `whisper-server`, `whisper-cli` | `whisper-server-rocm`, `whisper-cli-rocm` |
 | [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | `sd-server` (web UI embedded), `sd-cli` | `sd-server-rocm` (web UI embedded), `sd-cli-rocm` |
 | [audio.cpp](https://github.com/0xShug0/audio.cpp) | `audiocpp_server`, `audiocpp_cli` (from base image); `audiocpp_gguf` (GGUF converter, built here, CPU-only, all tags) | — (no HIP backend upstream) |
 | llama-swap + [vllm-wrapper](https://github.com/mostlygeek/llama-swap/tree/main/cmd/vllm-wrapper) | `llama-swap`, `vllm-wrapper` (backend-independent, from base image) | |
+| `benchmark` (this repo, `scripts/benchmark`) | one CLI for server-level / `llama-bench` / standalone-variant benchmarks of the config's text entries, see [Benchmarking](#benchmarking) | (uses the `*-rocm` / `*-engram` binaries via `--variant`) |
 
 llama.cpp lives in self-contained directories `/opt/llama-vulkan`, `/opt/llama-rocm` and `/opt/llama-engram` (binaries, `libllama`/`libggml*` and the per-CPU-level `libggml-cpu-*.so` variants, RPATH `$ORIGIN`) with symlinks in `/usr/local/bin`; whisper/sd binaries are static. `ik-llama-server` from the CUDA image is not included (upstream builds it CUDA-only). Exact versions of everything — including the glslc used and the enabled build options — are recorded in `/versions.txt` inside the image.
 
@@ -64,7 +65,7 @@ Build args:
 | `WITH_ENGRAM` | `true` | Build [EngramHalo.cpp](https://github.com/Aristo94/EngramHalo.cpp) as `*-engram` binaries. Only takes effect together with `WITH_ROCM=true` (the fork is HIP-only), so `:latest` never contains it. `false` skips the stage. |
 | `ENGRAM_REPO` / `ENGRAM_BRANCH` | Aristo94's repo, `strix-halo-qwen4exp` | Fork source. The branch rebases onto llama.cpp master and carries the Strix Halo patch series. |
 | `ENGRAM_TARGETS` | `gfx1151` | gfx targets for the EngramHalo build. gfx1151 alone on purpose: the fork's kernels are tuned for and only validated on Strix Halo. |
-| `WITH_QWEN4EXP` | `true` | Build `llama-server-qwen4exp` (Vulkan): master + the still-open qwen4exp PRs — #27836 MTP draft head and #28097 unsloth sidecar loading (both as rebased local patches), #28136 PLE direct reads (`--lazy-mode on-direct`), #28213 QSA gather decode, #28330 no indexer V cache, #27952 int8 coopmat. Restored 2026-09-02: the merged Sep 1 upstream set (#27941/#28040/#28123/#28023/#28121) did NOT include MTP (#28104 was withdrawn). Retire once #27836+#28097 merge. |
+| `WITH_QWEN4EXP` | `true` | Build `llama-server-qwen4exp` + `llama-bench-qwen4exp` (Vulkan): master + the still-open qwen4exp PRs — #27836 MTP draft head and #28097 unsloth sidecar loading (both as rebased local patches), #28136 PLE direct reads (`--lazy-mode on-direct`), #28213 QSA gather decode, #28330 no indexer V cache, #27952 int8 coopmat. Restored 2026-09-02: the merged Sep 1 upstream set (#27941/#28040/#28123/#28023/#28121) did NOT include MTP (#28104 was withdrawn). Retire once #27836+#28097 merge. |
 | `QWEN4EXP_COMMIT` / `QWEN4EXP_PATCHES` | `master` / `27952 28136 28213 28330` | Revision + PR set for that build; same drift rules as `LLAMA_PATCHES`. `patches/*.patch` apply on top (currently the rebased #27836 and #28097 — #27836 stopped merging cleanly on 2026-09-04, master's per-layer `n_ff_exp_arr`) and fail the build loudly when they stop applying. |
 | `MESA_PPA` | `ppa:kisak/kisak-mesa` | Newer Mesa/RADV for the final image; `""` keeps the base image's stock Mesa 25.2 |
 | `QWEN_TEMPLATE_URL` | froggeric's `chat_template.jinja` | Source of the fixed Qwen chat template shipped at `/etc/llama-swap/templates/qwen-fixed.jinja` (see below) |
@@ -162,6 +163,49 @@ docker run --rm --device /dev/dri --entrypoint llama-bench \
 # Versions baked into the image
 docker run --rm --entrypoint cat ghcr.io/selfref/llama-swap-docker-amd:latest /versions.txt
 ```
+
+## Benchmarking
+
+`benchmark` (in `/usr/local/bin`, source `scripts/benchmark`) measures the llama.cpp text entries of
+the mounted llama-swap `config.yaml` and prints one table: model, the parameters that matter
+(quant, context, KV types, speculative type / draft length, placement, batch sizes) and the numbers.
+
+```sh
+docker compose exec llama-swap benchmark                         # every listed text entry, all presets
+docker compose exec llama-swap benchmark qwen38 qwen38-hh        # server-level, via llama-swap
+docker compose exec llama-swap benchmark --prompt prose,prefill --prefill-tokens 65536 qwen38-fl
+docker compose exec llama-swap benchmark --kernel --std --unload qwen38      # llama-bench, community-comparable line
+docker compose exec llama-swap benchmark --kernel --variant qwen4exp qwen38-fl
+docker compose exec llama-swap benchmark --standalone --variant rocm --unload qwen38   # this entry on the ROCm build
+docker compose exec llama-swap benchmark --sampled qwen38:l      # production sampling + filters (not comparable)
+docker compose exec llama-swap benchmark --list                  # parsed entries, no requests
+```
+
+| Mode | What runs | What it tells you |
+|---|---|---|
+| server (default) | greedy requests through `/upstream/<model>/` (real entry flags: MTP, mmproj, `--parallel`, KV types; llama-swap filters bypassed) | what users get |
+| `--kernel` | `llama-bench[-<variant>]` on the entry's cached GGUF with the entry's KV/batch/placement flags, or `--std` for `-fa 1 -ctk q8_0 -ctv q4_0 -b 2048 -ub 512 -p 512 -n 128 -d 0,8192` | hardware / driver / build (no speculative decoding, no mmproj) |
+| `--standalone --variant V` | spawns `llama-server-<V>` with the entry's exact cmd (host/port substituted), benches it like server mode, kills it | binary A/Bs without a temporary config entry |
+| `--sampled` | llama-swap's `/v1/chat/completions` with the entry's filters (aliases like `:l` allowed) | production sampling; hash blank, not comparable with greedy |
+
+Presets (`--prompt`, default `all`): `prose` (free text, speculative worst case), `json` (structured
+output, best case), `refactor` (copy-heavy code edit, ~2k-token module), `agent` (tool-calling
+transcript, 6 tools, ~2.5k prompt tokens; column `call`), `tools` (single tool call, natural stop;
+`call`/`finish`), `reasoning` (`enable_thinking` on; `think`), `prefill` (pure big-context prefill,
+`--prefill-tokens`, default 32768 capped to the entry's context; `tok` is the real prompt length,
+`ttft` the prompt time). `--format md` prints rows for a markdown log, `--format json` for diffing.
+
+Notes: the tool holds the box while it runs -- a watcher thread polls llama-swap's `/running` and
+immediately unloads any model that is not the one under test (other services' requests fail for
+that moment; rows that saw an intruder are flagged `EVICTED:<n>`; `--no-guard` disables it and a
+stranger then only gets `CONTAMINATED`). Concurrent requests to the *same* model cannot be blocked
+and are detected through llama-server's `/metrics` counters (`SHARED`). `--kernel` and
+`--standalone` refuse to start while models are resident unless `--unload` is given. `--fit on` entries map to `-fitt 1024` in kernel mode (llama-server's margin), `-ngl all`
+to llama-bench's default. `gtt` growth above `--spill-threshold` (default 1.5 GiB) on a
+VRAM-resident entry flags `SPILL`; on UMA GPUs (Strix Halo) the check is off. The `hash` is the
+sha256 of the first measured output and is reproducible for the same request sequence across
+loads and builds. Needs `LLAMA_SWAP_API_KEY` in the environment when llama-swap has `apiKeys`.
+`-rocm`/`-engram` variants exist only in the `:rocm` tag.
 
 ## Notes
 

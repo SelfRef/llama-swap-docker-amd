@@ -7,11 +7,13 @@ on:
     paths:
       - Dockerfile
       - config/**
+      - scripts/**
       - .github/workflows/build.yml
   pull_request:
     paths:
       - Dockerfile
       - config/**
+      - scripts/**
       - .github/workflows/build.yml
   schedule:
     # Weekly rebuild to pick up the current unified-vulkan base image, current

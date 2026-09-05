@@ -3,3 +3,5 @@
 !Dockerfile
 !config/
 !patches/
+!scripts/
+scripts/__pycache__/
