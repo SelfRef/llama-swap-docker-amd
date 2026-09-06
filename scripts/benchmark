@@ -446,6 +446,7 @@ class Guard:
     def __init__(self, swap: Swap | None, enabled: bool):
         self.swap, self.enabled = swap, enabled and swap is not None
         self.allowed: set[str] = set()
+        self.ours: set[str] = set()       # models this run loaded earlier (cpu-group ttl keeps them resident)
         self.evicted: list[str] = []      # intruders seen since the last take()
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -462,6 +463,7 @@ class Guard:
 
     def allow(self, *models: str) -> None:
         with self._lock:
+            self.ours |= self.allowed          # what we benchmarked before is ours, not an intruder
             self.allowed = set(models)
 
     def take(self) -> list[str]:
@@ -478,14 +480,18 @@ class Guard:
             with self._lock:
                 intruders = [m for m in resident if m not in self.allowed]
             for m in intruders:
-                warn(f"guard: evicting {m} (loaded by someone else during the benchmark)")
+                with self._lock:
+                    ours = m in self.ours
+                if not ours:
+                    warn(f"guard: evicting {m} (loaded by someone else during the benchmark)")
                 try:
                     if not self.swap.unload_model(m):
                         self.swap.unload()  # alias/unknown -> drop everything (allowed model reloads on demand)
                 except UserError:
                     pass
-                with self._lock:
-                    self.evicted.append(m)
+                if not ours:
+                    with self._lock:
+                        self.evicted.append(m)
 
 
 def versions() -> dict[str, str]:
