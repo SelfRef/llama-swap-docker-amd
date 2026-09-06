@@ -100,7 +100,7 @@ GREEDY = {"temperature": 0, "top_k": 1, "seed": 42, "id_slot": 0}
 STANDARD_BENCH = ["-fa", "1", "-ctk", "q8_0", "-ctv", "q4_0", "-b", "2048", "-ub", "512",
                   "-p", "512", "-n", "128", "-d", "0,8192"]
 FIT_MARGIN_MIB = 1024  # llama-server's --fit on default margin (1 GiB)
-VARIANTS = ("vulkan", "rocm", "engram", "next")
+VARIANTS = ("vulkan", "rocm", "engram")
 SIDECAR_PREFIXES = ("mmproj-", "mtp-", "dflash-", "eagle3-", "dspark-")
 PROMPT_ALIASES = {"story": "prose", "code": "json"}
 
@@ -1097,7 +1097,7 @@ def bench_kernel(entry: Entry, opts: argparse.Namespace, variant: str, swap: Swa
     if not shutil.which(binary):
         have = sorted(os.path.basename(p) for d in os.environ["PATH"].split(":")
                       for p in glob.glob(os.path.join(d, "llama-bench*")))
-        row.error = f"{binary} not in this image (have: {', '.join(have) or 'none'}; -rocm/-engram only in the :rocm tag)"
+        row.error = f"{binary} not in this image (have: {', '.join(have) or 'none'}; -rocm/-engram only in the :full tag)"
         return row
     try:
         gguf = resolve_gguf(entry)
@@ -1302,13 +1302,13 @@ def main() -> int:
     meta = {"date": today, "mode": mode, "presets": [p.name for p in presets], "repeat": opts.repeat,
             "n_predict": opts.n_predict, "prefill_tokens": opts.prefill_tokens,
             "llama_vulkan_commit": ver.get("llama_vulkan_commit", "?").split()[0],
-            "llama_next_commit": ver.get("llama_next_commit", "?").split()[0],
+            "llama_patches": ver.get("llama_patches", ""),
             "llama_swap": ver.get("llama-swap", "?"), "models": [t[0].key for t in targets]}
     table = TablePrinter(kernel=opts.kernel, enabled=(opts.format == "table"))
     if opts.format == "table":
         print(f"benchmark {today} mode={mode} presets={','.join(meta['presets'])} repeat={opts.repeat} "
               f"llama.cpp={meta['llama_vulkan_commit'][:8]}"
-              + (f" next={meta['llama_next_commit'][:8]}" if meta['llama_next_commit'] != '?' else "")
+              + (f" prs={meta['llama_patches'].replace(' ', ',')}" if meta['llama_patches'] else "")
               + (" SAMPLED -- not comparable with greedy rows" if opts.sampled else "") + "\n", flush=True)
         table.header()
 

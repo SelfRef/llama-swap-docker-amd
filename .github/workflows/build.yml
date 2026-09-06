@@ -7,18 +7,23 @@ on:
     paths:
       - Dockerfile
       - config/**
+      - patches/**
       - scripts/**
+      - upstream/**
       - .github/workflows/build.yml
   pull_request:
     paths:
       - Dockerfile
       - config/**
+      - patches/**
       - scripts/**
+      - upstream/**
       - .github/workflows/build.yml
   schedule:
-    # Rebuild every 3 days to pick up the current unified-vulkan base image,
-    # current llama.cpp master and the matching whisper.cpp /
-    # stable-diffusion.cpp revisions. Scheduled runs publish both images.
+    # Rebuild every 3 days from the current default branches of llama-swap,
+    # llama.cpp, whisper.cpp, stable-diffusion.cpp, audio.cpp and EngramHalo,
+    # with the current heads of the merged PRs. Scheduled runs publish both
+    # images.
     - cron: "0 4 */3 * *"
   workflow_dispatch:
     inputs:
@@ -35,6 +40,14 @@ on:
         description: "upstream llama.cpp PR numbers to merge (space-separated); empty = Dockerfile default"
         required: false
         default: ""
+      llama_swap_commit:
+        description: "llama-swap revision (sha/tag such as v255/branch); empty = Dockerfile default (main)"
+        required: false
+        default: ""
+      llama_swap_patches:
+        description: "upstream llama-swap PR numbers to merge (space-separated); empty = Dockerfile default"
+        required: false
+        default: ""
 
 concurrency:
   group: build-${{ github.ref }}
@@ -47,16 +60,21 @@ concurrency:
 #                    or a manual run with the "rocm" checkbox; the HIP stages
 #                    are fat multi-gfx builds that take hours on a runner.
 #                    :latest is the full image.
+#
+# Nothing is inherited from another image any more, so nothing in the build
+# would change between two scheduled runs by itself: the prepare job resolves
+# every branch, tag and PR head to a commit ONCE (scripts/resolve-refs.sh) and
+# every job builds with those as build args. That is both the cache key (a
+# moved branch or updated PR rebuilds exactly the stages that use it) and the
+# guarantee that the Vulkan and ROCm builds of an engine, built in different
+# jobs hours apart, are the same revision.
 
 jobs:
-  # Lint, and pin the base image + image name once so every job in this run
-  # builds against the same unified-vulkan digest (it is rebuilt daily; a
-  # mid-run update would otherwise cause cache misses between jobs).
   prepare:
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.image.outputs.name }}
-      base: ${{ steps.base.outputs.ref }}
+      build_args: ${{ steps.refs.outputs.build_args }}
     steps:
       - uses: actions/checkout@v7
 
@@ -68,14 +86,35 @@ jobs:
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Pin base image digest
-        id: base
+      - name: Resolve upstream refs to commits
+        id: refs
+        env:
+          LLAMA_COMMIT: ${{ github.event.inputs.llama_commit }}
+          LLAMA_PATCHES: ${{ github.event.inputs.llama_patches }}
+          LLAMA_SWAP_COMMIT: ${{ github.event.inputs.llama_swap_commit }}
+          LLAMA_SWAP_PATCHES: ${{ github.event.inputs.llama_swap_patches }}
         run: |
-          DIGEST=$(docker buildx imagetools inspect \
-            ghcr.io/mostlygeek/llama-swap:unified-vulkan \
-            --format '{{.Manifest.Digest}}')
-          echo "Pinned unified-vulkan @ ${DIGEST}"
-          echo "ref=ghcr.io/mostlygeek/llama-swap@${DIGEST}" >> "$GITHUB_OUTPUT"
+          scripts/resolve-refs.sh | tee /tmp/build-args
+          { echo 'build_args<<EOF'; cat /tmp/build-args; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+          { echo '### Resolved refs'; echo '```'; cat /tmp/build-args; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      # The runtime contract (entrypoint, example config, package set) is
+      # vendored from upstream's docker/unified (see upstream/README.md). Warn,
+      # with the diff, when upstream changed one of those files -- the build
+      # still goes ahead with the vendored copy.
+      - name: Check vendored upstream files for drift
+        run: |
+          base=https://raw.githubusercontent.com/mostlygeek/llama-swap/main/docker/unified
+          drift=0
+          for f in run.sh audiocpp-server.example.json runtime.Dockerfile; do
+            curl -fsSL --retry 3 "$base/$f" -o "/tmp/$f" || { echo "::warning::could not fetch upstream $f"; continue; }
+            if ! diff -u "upstream/$f" "/tmp/$f" > "/tmp/$f.diff"; then
+              drift=1
+              echo "::warning file=upstream/$f::upstream docker/unified/$f has changed since it was vendored -- review the diff in the step summary and re-vendor"
+              { echo "### upstream/$f drifted"; echo '```diff'; cat "/tmp/$f.diff"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          [ "$drift" = 0 ] && echo "vendored upstream files are current" || true
 
   # One job per builder stage, in parallel; results land in per-stage registry
   # caches that the assemble jobs reuse. Vulkan stages always run.
@@ -89,7 +128,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [llama-vulkan, llama-next, whisper-vulkan, sd-vulkan, audiocpp-tools]
+        target: [llama-vulkan, whisper-vulkan, sd-vulkan, audiocpp, llama-swap-build]
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -112,10 +151,7 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64
           push: false
-          build-args: |
-            BASE_IMAGE=${{ needs.prepare.outputs.base }}
-            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
-            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+          build-args: ${{ needs.prepare.outputs.build_args }}
           cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }}
           cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache-{1},mode=max', needs.prepare.outputs.image, matrix.target) || '' }}
       - name: Build ${{ matrix.target }} stage (retry)
@@ -126,10 +162,7 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64
           push: false
-          build-args: |
-            BASE_IMAGE=${{ needs.prepare.outputs.base }}
-            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
-            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+          build-args: ${{ needs.prepare.outputs.build_args }}
           cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }}
           cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache-{1},mode=max', needs.prepare.outputs.image, matrix.target) || '' }}
 
@@ -181,10 +214,7 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64
           push: false
-          build-args: |
-            BASE_IMAGE=${{ needs.prepare.outputs.base }}
-            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
-            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+          build-args: ${{ needs.prepare.outputs.build_args }}
           cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }}
           cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }},mode=max
       - name: Build ${{ matrix.target }} stage (retry)
@@ -195,10 +225,7 @@ jobs:
           target: ${{ matrix.target }}
           platforms: linux/amd64
           push: false
-          build-args: |
-            BASE_IMAGE=${{ needs.prepare.outputs.base }}
-            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
-            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+          build-args: ${{ needs.prepare.outputs.build_args }}
           cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }}
           cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }},mode=max
 
@@ -246,17 +273,15 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BASE_IMAGE=${{ needs.prepare.outputs.base }}
             WITH_ROCM=false
-            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
-            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+            ${{ needs.prepare.outputs.build_args }}
           # GHA cache caps at 10 GB -- far too small here, so cache in the registry
           cache-from: |
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-vulkan
-            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-next
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
-            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp-tools
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-swap-build
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache,mode=max
       - name: Build and push (Vulkan only, retry)
@@ -269,16 +294,14 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BASE_IMAGE=${{ needs.prepare.outputs.base }}
             WITH_ROCM=false
-            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
-            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+            ${{ needs.prepare.outputs.build_args }}
           cache-from: |
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-vulkan
-            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-next
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
-            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp-tools
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-swap-build
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache,mode=max
 
@@ -341,16 +364,14 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BASE_IMAGE=${{ needs.prepare.outputs.base }}
             WITH_ROCM=true
-            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
-            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+            ${{ needs.prepare.outputs.build_args }}
           cache-from: |
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-vulkan
-            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-next
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
-            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp-tools
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-swap-build
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-rocm
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-engram
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-rocm
@@ -367,16 +388,14 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BASE_IMAGE=${{ needs.prepare.outputs.base }}
             WITH_ROCM=true
-            ${{ github.event.inputs.llama_commit != '' && format('LLAMA_COMMIT={0}', github.event.inputs.llama_commit) || '' }}
-            ${{ github.event.inputs.llama_patches != '' && format('LLAMA_PATCHES={0}', github.event.inputs.llama_patches) || '' }}
+            ${{ needs.prepare.outputs.build_args }}
           cache-from: |
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-vulkan
-            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-next
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-vulkan
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-sd-vulkan
-            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp-tools
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-audiocpp
+            type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-swap-build
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-rocm
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-llama-engram
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-whisper-rocm

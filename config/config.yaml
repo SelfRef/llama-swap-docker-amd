@@ -4,8 +4,10 @@
 #   ROCm (HIP):  llama-server-rocm, whisper-server-rocm, sd-server-rocm, ...
 #   Vulkan:      llama-server, whisper-server, sd-server, ...
 # Pick per model whichever backend suits your GPU. audio.cpp (audiocpp_server)
-# is Vulkan-only. Full config reference:
-# https://github.com/mostlygeek/llama-swap/wiki/Configuration
+# is Vulkan-only. Both llama.cpp builds are current master plus the open
+# upstream PRs listed in the Dockerfile (LLAMA_PATCHES); `llama-server-engram`
+# (Strix Halo fork, :full tag only) is the third llama.cpp. Full config
+# reference: https://github.com/mostlygeek/llama-swap/wiki/Configuration
 
 healthCheckTimeout: 300
 logRequests: true
