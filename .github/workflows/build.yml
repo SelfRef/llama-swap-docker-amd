@@ -16,13 +16,14 @@ on:
       - scripts/**
       - .github/workflows/build.yml
   schedule:
-    # Weekly rebuild to pick up the current unified-vulkan base image, current
-    # llama.cpp master and the matching whisper.cpp / stable-diffusion.cpp revisions
-    - cron: "0 4 * * 1"
+    # Rebuild every 3 days to pick up the current unified-vulkan base image,
+    # current llama.cpp master and the matching whisper.cpp /
+    # stable-diffusion.cpp revisions. Scheduled runs publish both images.
+    - cron: "0 4 */3 * *"
   workflow_dispatch:
     inputs:
       rocm:
-        description: "Also build the ROCm stages and publish the full image as :rocm, as branch pushes do (hours of runner time)"
+        description: "Also build the ROCm stages and publish the full image as :full/:latest, as branch pushes do (hours of runner time)"
         type: boolean
         required: false
         default: false
@@ -40,10 +41,12 @@ concurrency:
   cancel-in-progress: true
 
 # Two published images from one Dockerfile (WITH_ROCM build arg):
-#   :latest  Vulkan only  -- every push / weekly schedule / manual run
-#   :rocm    Vulkan+ROCm  -- every branch push, or a manual run with the "rocm"
-#            checkbox; the HIP stages are fat multi-gfx builds that take hours
-#            on a runner.
+#   :vulkan          Vulkan only  -- every push, the 3-day scheduled rebuild,
+#                    and every manual run.
+#   :full / :latest  Vulkan+ROCm  -- every push, the 3-day scheduled rebuild,
+#                    or a manual run with the "rocm" checkbox; the HIP stages
+#                    are fat multi-gfx builds that take hours on a runner.
+#                    :latest is the full image.
 
 jobs:
   # Lint, and pin the base image + image name once so every job in this run
@@ -131,10 +134,12 @@ jobs:
           cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}:buildcache-{1},mode=max', needs.prepare.outputs.image, matrix.target) || '' }}
 
   # The ROCm stages are fat HIP builds (8 gfx targets, all-quant flash
-  # attention): on every branch push, or a manual run with the "rocm" checkbox.
+  # attention): on every push and scheduled rebuild, or a manual run with the
+  # "rocm" checkbox.
   build-stages-rocm:
     if: >-
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')) ||
+      github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.rocm)
     needs: prepare
     runs-on: ubuntu-latest
@@ -197,7 +202,7 @@ jobs:
           cache-from: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }}
           cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache-${{ matrix.target }},mode=max
 
-  # Vulkan-only image -> :latest (+ sha / schedule-date tags). Skipped on PRs:
+  # Vulkan-only image -> :vulkan (+ sha / date / version tags). Skipped on PRs:
   # the matrix above already validates the builds.
   build:
     if: github.event_name != 'pull_request'
@@ -222,13 +227,13 @@ jobs:
         with:
           images: ${{ needs.prepare.outputs.image }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=sha,format=short
-            type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=raw,value=vulkan,enable={{is_default_branch}}
+            type=semver,pattern={{version}},suffix=-vulkan
+            type=sha,format=short,prefix=vulkan-
+            type=schedule,pattern=vulkan-{{date 'YYYYMMDD'}}
           labels: |
             org.opencontainers.image.title=llama-swap-amd
-            org.opencontainers.image.description=llama-swap unified image for AMD GPUs (Vulkan; see :rocm for Vulkan+ROCm)
+            org.opencontainers.image.description=llama-swap unified image for AMD GPUs (Vulkan; see :full for Vulkan+ROCm)
       # Same 429 retry as in build-stages-vulkan.
       - name: Build and push (Vulkan only)
         id: build
@@ -277,11 +282,13 @@ jobs:
             type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ needs.prepare.outputs.image }}:buildcache,mode=max
 
-  # Full Vulkan+ROCm image -> :rocm (+ rocm-<sha>): every branch push, or a
-  # manual run with the "rocm" checkbox.
+  # Full Vulkan+ROCm image -> :full and :latest (+ full-<sha> / full-<date> /
+  # version tags): every push and the 3-day scheduled rebuild, or a manual run
+  # with the "rocm" checkbox.
   build-rocm:
     if: >-
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')) ||
+      github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.rocm)
     needs: [prepare, build-stages-vulkan, build-stages-rocm]
     runs-on: ubuntu-latest
@@ -314,8 +321,11 @@ jobs:
         with:
           images: ${{ needs.prepare.outputs.image }}
           tags: |
-            type=raw,value=rocm
-            type=sha,format=short,prefix=rocm-
+            type=raw,value=full,enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=sha,format=short,prefix=full-
+            type=schedule,pattern=full-{{date 'YYYYMMDD'}}
           labels: |
             org.opencontainers.image.title=llama-swap-amd
             org.opencontainers.image.description=llama-swap unified image for AMD GPUs (Vulkan + ROCm)
