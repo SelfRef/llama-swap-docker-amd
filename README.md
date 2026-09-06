@@ -77,7 +77,7 @@ Build args:
 | `ROCM_VERSION` | `7.2.4` | classic channel: builder image tag and apt repo path |
 | `AMDGPU_TARGETS` | `gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201` | gfx architectures compiled into the HIP binaries (RDNA2/3/3.5/4). CDNA (`gfx908;gfx90a;gfx942`) is not included by default — add it if you run Instinct cards. Trim to just your GPU for a much faster build. |
 | `LLAMA_COMMIT` | `master` | llama.cpp revision for both the Vulkan and the ROCm build (sha, tag, branch, or `refs/pull/N/head`). |
-| `LLAMA_PATCHES` | 14 PRs, see below | Space-separated upstream llama.cpp PR numbers merged on top of `LLAMA_COMMIT`, for both backends, fetched over git as `refs/pull/N/head`. A PR that is closed on GitHub is skipped with a notice; one that no longer merges cleanly fails the build — never a silent no-op. `patches/*.patch` (local rebased patches, empty since 2026-09-06) apply on top. See [Upstream PRs in the llama.cpp build](#upstream-prs-in-the-llamacpp-build). |
+| `LLAMA_PATCHES` | 13 PRs, see below | Space-separated upstream llama.cpp PR numbers merged on top of `LLAMA_COMMIT`, for both backends, fetched over git as `refs/pull/N/head`. A PR that is closed on GitHub is skipped with a notice; one that no longer merges cleanly fails the build — never a silent no-op. `patches/*.patch` (local rebased patches, empty since 2026-09-06) apply on top. See [Upstream PRs in the llama.cpp build](#upstream-prs-in-the-llamacpp-build). |
 | `WHISPER_COMMIT` / `SD_COMMIT` / `AUDIOCPP_COMMIT` | `master` / `master` / `main` | Revision of the other engines (sha, tag or branch). |
 | `GLSLC_SUITE` | `resolute` | Ubuntu release whose `glslc`/`libshaderc1` are used by the Vulkan builder (only those two packages; everything else stays 24.04) |
 | `LLAMA_FA_ALL_QUANTS` | `ON` | ROCm llama.cpp: compile flash-attention kernels for all K/V cache quant combinations (without it only q8_0/q8_0 and q4_0/q4_0 stay on the GPU, see llama.cpp #27761). Set `OFF` for a faster build. |
@@ -126,7 +126,7 @@ The binaries contain gfx1151 code only (`ENGRAM_TARGETS`) and exist only in the 
 scripts/checkout-with-prs.sh https://github.com/ggml-org/llama.cpp.git master /tmp/llama.cpp 27952 28024 ...
 ```
 
-Until 2026-09-06 there were two Vulkan builds — a "pure" `llama-server` with only #27952 and a `llama-server-next` with the full set. The full set had become the one actually serving models, and none of the PRs touches CUDA/HIP sources, so they were merged into one build that the ROCm side now shares. The current set (all merged cleanly against master `9e0e2205` on 2026-09-06; `#28422` topk_moe fusion was dropped for conflicting with `#28024`):
+Until 2026-09-06 there were two Vulkan builds — a "pure" `llama-server` with only #27952 and a `llama-server-next` with the full set. The full set had become the one actually serving models, and none of the PRs touches CUDA/HIP sources, so they were merged into one build that the ROCm side now shares. The current set (all merged cleanly against master `9e0e2205` on 2026-09-06; `#28422` topk_moe fusion was dropped for conflicting with `#28024`; `#28068` GDN norm max→rsqrt was retired the same day when it merged upstream):
 
 | PR | area | what | status upstream |
 |---|---|---|---|
@@ -136,7 +136,6 @@ Until 2026-09-06 there were two Vulkan builds — a "pure" `llama-server` with o
 | [#28253](https://github.com/ggml-org/llama.cpp/pull/28253) | Vulkan | type-aligned quantized GET_ROWS | approved ×4 |
 | [#28457](https://github.com/ggml-org/llama.cpp/pull/28457) | Vulkan | small-M matmul tiles for Qwen buckets | new |
 | [#28243](https://github.com/ggml-org/llama.cpp/pull/28243) | models | Qwen3.8-Flash-Next MTP + draft-only sidecar (unsloth) | draft, ggerganov reviewing |
-| [#28068](https://github.com/ggml-org/llama.cpp/pull/28068) | models | GDN norm max→rsqrt | approved ×2 |
 | [#28265](https://github.com/ggml-org/llama.cpp/pull/28265) | models | Qwen3.5-family delta-net out-proj 2D (+6-9% batched TG on Strix Halo) | open |
 | [#28213](https://github.com/ggml-org/llama.cpp/pull/28213) | models | qwen4exp QSA gather decode | open |
 | [#28136](https://github.com/ggml-org/llama.cpp/pull/28136) | loading | direct reads for the lazy PLE table | approved by pwilkin |

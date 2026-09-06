@@ -197,7 +197,6 @@ ARG LLAMA_COMMIT="master"
 #   Models
 #   #28243 Qwen3.8-Flash-Next MTP draft head + draft-only sidecar loading
 #          (unsloth's upstream PR; supersedes the local #27836/#28097 rebases)
-#   #28068 gated-delta-net norm max->rsqrt (matches the Qwen reference) -- approved
 #   #28265 keep Qwen3.5-family delta-net out-proj 2D (Strix Halo: +6-9% TG at
 #          batch 4-8 = our --parallel 2 + MTP verify batches)
 #   #28213 gather-based sparse attention for qwen4exp QSA decode (+50% tg
@@ -211,13 +210,14 @@ ARG LLAMA_COMMIT="master"
 #   #28333 zero the MTP carrier at sequence start (determinism across requests)
 #   #25592 exact-position checkpoint restore for hybrid/recurrent models
 #          (agentic multi-turn @130k: 35 s -> 1.3 s turn restore) -- to benchmark
+# Retired as merged upstream: #28068 (GDN norm max->rsqrt, merged 2026-09-06).
 # Measured and NOT adopted: #25483 (MoE coopmat skip, +0.3%), #26284 + #26301
 # (HIP MMQ tuning / mmvdq: +2% pp, decode same, and #26284 carries RDNA4
 # changes its maintainer wants dropped), #22970 (stale, conflicts with master).
 # patches/*.patch (local rebased patches) apply after the merges to both
 # backends; the directory is EMPTY since 2026-09-06 (see patches/README.md).
 # Retire PRs from the list as they merge (the build says so).
-ARG LLAMA_PATCHES="27952 28024 27220 28253 28457 28243 28068 28265 28213 28136 28330 27210 28333 25592"
+ARG LLAMA_PATCHES="27952 28024 27220 28253 28457 28243 28265 28213 28136 28330 27210 28333 25592"
 
 # Cache key only (see LLAMA_SWAP_PATCHES_HEADS).
 ARG LLAMA_PATCHES_HEADS=""
