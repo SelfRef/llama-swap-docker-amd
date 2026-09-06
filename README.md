@@ -1,6 +1,6 @@
 # llama-swap Docker image for AMD GPUs (ROCm + Vulkan)
 
-A drop-in replacement for the [llama-swap](https://github.com/mostlygeek/llama-swap) `unified-vulkan` image, built from source for AMD hardware: same binaries, paths, config locations and entrypoint as upstream (`LLAMA_SWAP_*` environment variables included), but with **both GPU stacks**, everything at its **current upstream revision**, and the open PRs worth having merged in:
+The [llama-swap](https://github.com/mostlygeek/llama-swap) `unified-vulkan` image rebuilt from source for AMD hardware: the same binary names, config location and port, so a config written for upstream's image works here, but with **both GPU stacks**, everything at its **current upstream revision**, and the open PRs worth having merged in:
 
 - **llama-swap itself built from source** — current `main` plus open upstream PRs (`LLAMA_SWAP_PATCHES`, today [#1099](https://github.com/mostlygeek/llama-swap/pull/1099): live per-turn generation stats in the Playground Chat), web UI embedded, `vllm-wrapper` from the same tree. It is *the* `llama-swap` binary, not a side binary.
 - **llama.cpp from current master plus open upstream PRs** (`LLAMA_PATCHES`: Vulkan fusions and int8 coopmat matmul, Qwen 3.5/3.6/3.8 fixes, Qwen3.8-Flash-Next MTP, adaptive MTP, exact checkpoint restore — see [Upstream PRs in the llama.cpp build](#upstream-prs-in-the-llamacpp-build)), the **same tree for the Vulkan and the ROCm build**. There is no un-patched llama.cpp in the image: `llama-server` is the patched build.
@@ -22,18 +22,16 @@ Both llama.cpp backends are built with runtime CPU dispatch (`GGML_CPU_ALL_VARIA
 | [audio.cpp](https://github.com/0xShug0/audio.cpp) main | `audiocpp_server`, `audiocpp_cli`, `audiocpp_gguf` (GGUF converter, upstream ships none) | — (no HIP backend upstream) |
 | `benchmark` (this repo, `scripts/benchmark`) | one CLI for server-level / `llama-bench` / standalone-variant benchmarks of the config's text entries, see [Benchmarking](#benchmarking) | (uses the `*-rocm` / `*-engram` binaries via `--variant`) |
 
-llama.cpp lives in self-contained directories `/opt/llama-vulkan`, `/opt/llama-rocm` and `/opt/llama-engram` (binaries, `libllama`/`libggml*` and the per-CPU-level `libggml-cpu-*.so` variants, RPATH `$ORIGIN`) with symlinks in `/usr/local/bin`; whisper/sd/audio.cpp binaries are static. `ik-llama-server` from the CUDA image is not included (upstream builds it CUDA-only). Exact versions of everything — every commit, every merged PR, the glslc used and the enabled build options — are recorded in `/versions.txt` inside the image (upstream's keys first, so anything that reads the unified image's file keeps working).
+llama.cpp lives in self-contained directories `/opt/llama-vulkan`, `/opt/llama-rocm` and `/opt/llama-engram` (binaries, `libllama`/`libggml*` and the per-CPU-level `libggml-cpu-*.so` variants, RPATH `$ORIGIN`) with symlinks in `/usr/local/bin`; whisper/sd/audio.cpp binaries are static. Exact versions of everything — every commit, every merged PR, the glslc used and the enabled build options — are recorded in `/versions.txt` inside the image.
 
-## Compatibility with the upstream image
+## Runtime layout
 
-The image is built from plain `ubuntu:24.04` (it used to extend `ghcr.io/mostlygeek/llama-swap:unified-vulkan`; see [Why not build on the upstream image](#why-not-build-on-the-upstream-image)) and reproduces upstream's runtime contract from [`docker/unified/runtime.Dockerfile`](https://github.com/mostlygeek/llama-swap/blob/main/docker/unified/runtime.Dockerfile):
+Built from plain `ubuntu:24.04` (see [Why not build on the upstream image](#why-not-build-on-the-upstream-image)); nothing from upstream's `docker/unified` is vendored.
 
-- Same package set: `libgomp1 libvulkan1 mesa-vulkan-drivers rocm-smi python3 curl ffmpeg` + libav\*, `python3-numpy python3-sentencepiece python3-pip`, `uv`/`uvx` (plus `python3-yaml` for `benchmark`). `rocm-smi` is what llama-swap uses for GPU monitoring in its UI.
-- Same paths: binaries in `/usr/local/bin`, config at `/etc/llama-swap/config/config.yaml`, models in `/models` (the working directory), `/etc/llama-swap/audiocpp-server.example.json` with the backend set to `vulkan`, audio.cpp's spec catalog at `/usr/local/share/audiocpp/model_specs`, `/app`, `/versions.txt`.
-- Same entrypoint: upstream's `run.sh`, vendored verbatim in [upstream/](upstream/README.md). With no arguments it runs `llama-swap -config /etc/llama-swap/config/config.yaml -listen 0.0.0.0:8080 -watch-config`, and `LLAMA_SWAP_CONFIG`, `LLAMA_SWAP_CONFIG_DIR`, `LLAMA_SWAP_LISTEN`, `LLAMA_SWAP_TLS_CERT_FILE`, `LLAMA_SWAP_TLS_KEY_FILE`, `LLAMA_SWAP_LISTEN_TAILCAT`, `LLAMA_SWAP_WATCH_CONFIG` map to the corresponding flags. Any argument passed to the container replaces all of that (`docker run <image> -config /models/my.yaml` behaves as it always did).
+- Binaries in `/usr/local/bin`; config at `/etc/llama-swap/config/config.yaml` (mount the directory or the file); models in `/models` (the working directory); audio.cpp's spec catalog at `/usr/local/share/audiocpp/model_specs`; `/versions.txt`.
+- Entrypoint is `llama-swap` itself with `-config /etc/llama-swap/config/config.yaml -listen 0.0.0.0:8080 -watch-config` as the default `CMD`. Any argument passed to the container replaces those defaults (`docker run <image> -version`, `docker run <image> -config /models/my.yaml -listen 0.0.0.0:8080`).
+- Also present: `rocm-smi` (llama-swap's GPU monitor in its UI reads it; sysfs-based, works without the ROCm runtime), `ffmpeg` + libav\* (whisper-server input decoding), `curl`, `python3` + PyYAML (for `benchmark`), `uv`/`uvx`.
 - Runs as root, like upstream's root variant. There is no `-rootless` tag.
-
-CI fetches upstream's `run.sh`, example JSON and `runtime.Dockerfile` on every run and warns with a diff when one changed, so upstream additions to the contract show up in the next run's annotations rather than drifting silently.
 
 ## Why build the Vulkan binaries ourselves
 
@@ -45,7 +43,7 @@ The larger measured win on current GPUs is the driver: the final image takes `me
 
 ## Why not build on the upstream image
 
-Until 2026-09-06 this image was `FROM ghcr.io/mostlygeek/llama-swap:unified-vulkan` and replaced the engines. Once llama-swap itself had to be built from source (its open PRs are UI changes, so they cannot be applied to the release binary), the base contributed one apt line, two audio.cpp binaries and three commit hashes — and cost real things: deleting the base's engine binaries in a child layer does not remove them from the image, so every pull carried ~650 MB of unreachable files (the base's llama.cpp, sd and ggml builds plus the stock Mesa shadowed by the PPA one); the daily base rebuild invalidated every final layer whether or not anything relevant changed; and the tags could lag upstream by days. Building from `ubuntu:24.04` with the contract vendored (above) removes all of that, and every project is now taken directly from its default branch.
+Until 2026-09-06 this image was `FROM ghcr.io/mostlygeek/llama-swap:unified-vulkan` and replaced the engines. Once llama-swap itself had to be built from source (its open PRs are UI changes, so they cannot be applied to the release binary), the base contributed one apt line, two audio.cpp binaries and three commit hashes — and cost real things: deleting the base's engine binaries in a child layer does not remove them from the image, so every pull carried ~650 MB of unreachable files (the base's llama.cpp, sd and ggml builds plus the stock Mesa shadowed by the PPA one); the daily base rebuild invalidated every final layer whether or not anything relevant changed; and the tags could lag upstream by days. Building from `ubuntu:24.04` removes all of that, and every project is now taken directly from its default branch.
 
 ## Get the image
 
@@ -172,7 +170,7 @@ docker run -it --rm \
 
 Or `docker compose up` — see [compose.yml](compose.yml). The llama-swap UI is at http://localhost:8080. The host only needs the `amdgpu` kernel driver (ROCm userspace lives in the image); Vulkan-only use works without `/dev/kfd`.
 
-Edit [config/config.yaml](config/config.yaml) to define your models — it shows the pattern: the same engine as `*-rocm` (ROCm) or plain (Vulkan), chosen per model. The container watches the config and reloads on change. Instead of mounting a config you can also point at one with `-e LLAMA_SWAP_CONFIG=/models/my.yaml` (see [Compatibility](#compatibility-with-the-upstream-image)).
+Edit [config/config.yaml](config/config.yaml) to define your models — it shows the pattern: the same engine as `*-rocm` (ROCm) or plain (Vulkan), chosen per model. The container watches the config and reloads on change. To use a config elsewhere, pass the flags as the container command (they replace the defaults, see [Runtime layout](#runtime-layout)): `... ghcr.io/selfref/llama-swap-docker-amd:latest -config /models/my.yaml -listen 0.0.0.0:8080 -watch-config`.
 
 ## Choosing ROCm vs Vulkan
 
@@ -279,7 +277,7 @@ loads and builds. Needs `LLAMA_SWAP_API_KEY` in the environment when llama-swap 
 
 ## Sources
 
-- [llama-swap unified container docs](https://github.com/mostlygeek/llama-swap/tree/main/docker/unified) (the runtime contract this image reproduces; vendored files in [upstream/](upstream/README.md))
+- [llama-swap unified container docs](https://github.com/mostlygeek/llama-swap/tree/main/docker/unified) (the image this one mirrors in layout)
 - [llama.cpp ROCm Dockerfile](https://github.com/ggml-org/llama.cpp/blob/master/.devops/rocm.Dockerfile) (ROCm version + gfx target list followed here)
 - [whisper.cpp ROCm build docs](https://github.com/ggml-org/whisper.cpp#amd-rocm-gpu-support)
 - [EngramHalo.cpp Strix Halo docs](https://github.com/Aristo94/EngramHalo.cpp/blob/strix-halo-qwen4exp/docs/strix-halo/README.md) (fork background, benchmarks, MTP sidecar)

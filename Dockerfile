@@ -1,10 +1,10 @@
 # llama-swap for AMD GPUs — ROCm + Vulkan in one image, built from source
 #
-# A drop-in replacement for ghcr.io/mostlygeek/llama-swap:unified-vulkan (same
-# binaries and paths, same config locations, same run.sh entrypoint and
-# LLAMA_SWAP_* environment mapping -- see upstream/README.md), built from plain
-# ubuntu:24.04 instead of on top of the upstream image. Everything in it is
-# compiled here from the projects' current default branches:
+# The same shape as ghcr.io/mostlygeek/llama-swap:unified-vulkan (binary names
+# in /usr/local/bin, config at /etc/llama-swap/config/config.yaml, models in
+# /models, port 8080) so a config written for that image works here, but built
+# from plain ubuntu:24.04 with no upstream image in the chain. Everything in it
+# is compiled here from the projects' current default branches:
 #
 #   - llama-swap itself, from source (LLAMA_SWAP_COMMIT + the open upstream PRs
 #     in LLAMA_SWAP_PATCHES, web UI embedded) and vllm-wrapper from the same
@@ -60,6 +60,8 @@
 # hashes -- and cost ~650 MB per pull in binaries that were deleted in a child
 # layer but still shipped in the parent layers, plus a daily base rebuild that
 # invalidated every final-stage layer whether or not anything relevant changed.
+# Nothing of upstream's docker/unified is vendored either: the entrypoint is
+# llama-swap itself (defaults in CMD, so container arguments replace them).
 #
 # Versions: every project is built from the ref in its *_COMMIT arg (default:
 # the current default branch). Because nothing in the build context changes
@@ -977,8 +979,6 @@ FROM llama-engram-${WITH_ROCM}-${WITH_ENGRAM} AS llama-engram-sel
 
 # ══════════════════════════════════════════════════════════════════════
 # ── Final image: Ubuntu 24.04 runtime (+ ROCm) + everything built above ──
-# Mirrors upstream's docker/unified/runtime.Dockerfile (vendored for reference
-# in upstream/runtime.Dockerfile): same packages, paths, user, entrypoint.
 
 FROM ubuntu:24.04 AS final
 ARG ROCM_CHANNEL
@@ -1000,27 +1000,31 @@ ENV PATH="/usr/local/bin:${PATH}"
 # Cache key for everything below (see the arg's comment at the top).
 ARG BUILD_DATE
 
-# Upstream's runtime package set for the vulkan flavour (runtime.Dockerfile:
-# libgomp1 libvulkan1 mesa-vulkan-drivers rocm-smi python3 curl ca-certificates
-# libav* ffmpeg, then python3-numpy python3-sentencepiece python3-pip and uv
-# via pip) plus python3-yaml for the bundled `benchmark` CLI. Mesa: only
-# mesa-vulkan-drivers (+ deps) is taken from the PPA, not the whole GL stack;
-# software-properties-common is only needed to add it and is purged again.
+# Runtime packages: Vulkan loader + RADV, libgomp for the CPU backends, libav*
+# + ffmpeg for whisper-server's WHISPER_FFMPEG input decoding, rocm-smi for
+# llama-swap's GPU monitor in its UI (sysfs-based, works without the ROCm
+# runtime), curl for healthchecks, python3 + PyYAML for the bundled `benchmark`
+# CLI. Mesa: only mesa-vulkan-drivers (+ deps) is taken from the PPA, not the
+# whole GL stack; software-properties-common is only needed to add it and is
+# purged again.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 libvulkan1 mesa-vulkan-drivers \
         rocm-smi \
-        python3 curl ca-certificates \
+        curl ca-certificates \
         libavcodec60 libavformat60 libavutil58 libswresample4 \
         ffmpeg \
-        python3-numpy python3-sentencepiece python3-pip python3-yaml \
+        python3 python3-yaml \
     && if [ -n "${MESA_PPA}" ]; then \
         apt-get install -y --no-install-recommends software-properties-common \
         && add-apt-repository -y "${MESA_PPA}" \
         && apt-get install -y --no-install-recommends --only-upgrade mesa-vulkan-drivers \
         && apt-get purge -y --auto-remove software-properties-common; \
     fi \
-    && pip install uv --break-system-packages \
-    && rm -rf /var/lib/apt/lists/* /root/.cache/pip
+    && rm -rf /var/lib/apt/lists/*
+
+# uv/uvx (static binaries from the official image) for `uvx`-launched tools in
+# config.yaml commands and maintenance scripts (e.g. `uvx --from huggingface_hub hf`).
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 # ROCm userspace matching the builder's channel (see ROCM_CHANNEL).
 # classic: hipblas/rocblas pull in the HIP runtime (libamdhip64), hsa-rocr,
@@ -1067,9 +1071,7 @@ RUN if [ "${WITH_ROCM}" = "true" ]; then \
 
 ENV PATH="/opt/rocm/bin:${PATH}"
 
-# Directories of the upstream image: /app (its WORKDIR during assembly, and
-# the home of the rootless variant's user), the config dir, the models dir.
-RUN mkdir -p /app /etc/llama-swap/config /models
+RUN mkdir -p /etc/llama-swap/config /models
 
 # ── Binaries ──
 COPY --from=llama-vulkan   /install/llama-vulkan/ /opt/llama-vulkan/
@@ -1106,16 +1108,6 @@ RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
     else rmdir /opt/llama-engram; fi \
     && ldconfig
 
-# ── Upstream runtime contract (upstream/README.md) ──
-# run.sh: the entrypoint that maps LLAMA_SWAP_* env vars to flags; container
-# arguments replace all of them (the pre-run.sh ENTRYPOINT ["llama-swap"] + CMD
-# behaviour), so `docker run <image> -config /models/my.yaml` still works.
-COPY --chmod=0755 upstream/run.sh /usr/local/bin/run.sh
-# audiocpp_server's own JSON config, starter with this image's backend baked in
-# (the binary defaults to "cuda").
-COPY upstream/audiocpp-server.example.json /etc/llama-swap/audiocpp-server.example.json
-RUN sed -i "s/__BACKEND__/vulkan/" /etc/llama-swap/audiocpp-server.example.json
-
 # Example config with both backends; override by mounting /etc/llama-swap/config
 COPY config/config.yaml /etc/llama-swap/config/config.yaml
 
@@ -1145,8 +1137,8 @@ RUN chmod 755 /etc/llama-swap/templates
 # libraries (catches a missing ROCm runtime package or a broken RPATH), and
 # smoke-test that each llama-server starts, finds its ggml backends next to
 # itself and lists devices (no GPU here, so the list is empty -- the point is
-# that backend loading does not fail), that llama-swap runs and accepts the
-# bundled config, and that the entrypoint resolves.
+# that backend loading does not fail), and that llama-swap runs and accepts
+# the bundled config.
 RUN <<'CHECK'
 #!/bin/bash
 set -euo pipefail
@@ -1191,17 +1183,15 @@ llama-swap -version
 vllm-wrapper --help >/dev/null 2>&1 || vllm-wrapper -h >/dev/null 2>&1 || true
 llama-swap -config /etc/llama-swap/config/config.yaml -validate
 uv --version && uvx --version
-python3 -c "import yaml, numpy, sentencepiece" || { echo "FATAL: python modules missing" >&2; exit 1; }
+python3 -c "import yaml" || { echo "FATAL: PyYAML missing" >&2; exit 1; }
 benchmark --list --config /etc/llama-swap/config/config.yaml >/dev/null \
     || { echo "FATAL: benchmark --list failed on the bundled config" >&2; exit 1; }
-test -x /usr/local/bin/run.sh && test -f /etc/llama-swap/audiocpp-server.example.json \
-    && grep -q '"backend": "vulkan"' /etc/llama-swap/audiocpp-server.example.json
 test -d /usr/local/share/audiocpp/model_specs
 ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ' | sed 's/^/cpu variants: /; s/ $/\n/'
 CHECK
 
-# /versions.txt: upstream's keys first (same names, so tooling that reads the
-# unified image's file keeps working), then everything this image adds.
+# /versions.txt: one-line summary per project first, then every stage's full
+# build-info (base commit, merged PRs, build options).
 RUN <<'VERSIONS'
 #!/bin/bash
 set -euo pipefail
@@ -1210,12 +1200,10 @@ first() { awk -v k="$1" '$1==k {print $2; exit}' "/tmp/build-info/$2"; }
   echo "llama.cpp: $(first llama_vulkan_commit: llama-vulkan)"
   echo "whisper.cpp: $(first whisper_vulkan_commit: whisper-vulkan)"
   echo "stable-diffusion.cpp: $(first sd_vulkan_commit: sd-vulkan)"
-  echo "ik_llama.cpp: n/a"
   echo "audio.cpp: $(first audiocpp_commit: audiocpp)"
   echo "llama-swap: $(first llama_swap_version: llama-swap)"
   if [ "${WITH_ROCM}" = "true" ]; then echo "backend: vulkan rocm"; else echo "backend: vulkan"; fi
   echo "build_timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "with_rocm: ${WITH_ROCM}"
   if [ "${WITH_ROCM}" = "true" ]; then
     if [ "${ROCM_CHANNEL}" = "classic" ]; then echo "rocm: ${ROCM_VERSION} (classic)"
     else echo "rocm: $(dpkg-query -W -f '${Version}' "amdrocm-runtime${ROCM_SERIES}") (multiarch, series ${ROCM_SERIES})"; fi
@@ -1233,10 +1221,11 @@ rm -rf /tmp/build-info
 cat /versions.txt
 VERSIONS
 
-# Same as upstream: root, /models as the working directory, run.sh as the
-# entrypoint with an explicitly empty CMD (an inherited CMD would arrive as
-# arguments to run.sh, which reads arguments as a full override).
+# Root (device access without --group-add), /models as the working directory.
+# llama-swap is the entrypoint and its defaults live in CMD, so any container
+# argument replaces them: `docker run <image> -version`, or
+# `docker run <image> -config /models/my.yaml -listen 0.0.0.0:8080 -watch-config`.
 WORKDIR /models
 USER 0
-ENTRYPOINT ["run.sh"]
-CMD []
+ENTRYPOINT ["llama-swap"]
+CMD ["-config", "/etc/llama-swap/config/config.yaml", "-listen", "0.0.0.0:8080", "-watch-config"]

@@ -9,7 +9,6 @@ on:
       - config/**
       - patches/**
       - scripts/**
-      - upstream/**
       - .github/workflows/build.yml
   pull_request:
     paths:
@@ -17,7 +16,6 @@ on:
       - config/**
       - patches/**
       - scripts/**
-      - upstream/**
       - .github/workflows/build.yml
   schedule:
     # Rebuild every 3 days from the current default branches of llama-swap,
@@ -97,24 +95,6 @@ jobs:
           scripts/resolve-refs.sh | tee /tmp/build-args
           { echo 'build_args<<EOF'; cat /tmp/build-args; echo 'EOF'; } >> "$GITHUB_OUTPUT"
           { echo '### Resolved refs'; echo '```'; cat /tmp/build-args; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-
-      # The runtime contract (entrypoint, example config, package set) is
-      # vendored from upstream's docker/unified (see upstream/README.md). Warn,
-      # with the diff, when upstream changed one of those files -- the build
-      # still goes ahead with the vendored copy.
-      - name: Check vendored upstream files for drift
-        run: |
-          base=https://raw.githubusercontent.com/mostlygeek/llama-swap/main/docker/unified
-          drift=0
-          for f in run.sh audiocpp-server.example.json runtime.Dockerfile; do
-            curl -fsSL --retry 3 "$base/$f" -o "/tmp/$f" || { echo "::warning::could not fetch upstream $f"; continue; }
-            if ! diff -u "upstream/$f" "/tmp/$f" > "/tmp/$f.diff"; then
-              drift=1
-              echo "::warning file=upstream/$f::upstream docker/unified/$f has changed since it was vendored -- review the diff in the step summary and re-vendor"
-              { echo "### upstream/$f drifted"; echo '```diff'; cat "/tmp/$f.diff"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
-          [ "$drift" = 0 ] && echo "vendored upstream files are current" || true
 
   # One job per builder stage, in parallel; results land in per-stage registry
   # caches that the assemble jobs reuse. Vulkan stages always run.

@@ -53,9 +53,8 @@ models:
       --steps 8
 
   # audio.cpp for TTS -- Vulkan build only (no HIP backend upstream).
-  # Needs its own JSON config; copy the starter shipped in the image:
-  #   docker run --rm --entrypoint cat <image> \
-  #     /etc/llama-swap/audiocpp-server.example.json > ./models/audiocpp-server.json
+  # Needs its own JSON server config (see audio.cpp's server docs); set
+  # "backend": "vulkan" in it -- the binary defaults to cuda.
   "audio":
     checkEndpoint: /health
     cmd: |
