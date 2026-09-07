@@ -52,6 +52,13 @@ Things the numbers have taught us (keep in mind when reading a row):
                CONTAMINATED). Requests to the SAME model on another slot cannot be
                blocked; they are detected via llama-server's /metrics counters and
                flagged SHARED.
+  * depth   -- decode speed at a deep context is where attention variants (QSA gather,
+               sparse FA) and speculative acceptance differ most, and none of the
+               short presets show it: 2026-09-07 three builds were within 5% on
+               short prompts and 20.1 vs 29.6 t/s at 39K. Also the one place where
+               ngram-mod pays (the answer quotes the prompt) -- read accept with it.
+  * --kernel on a Vulkan entry: llama-bench gets the entry's --load-mode; without
+    it Vulkan runs mmap OFF and pins every CPU-side tensor (77 GiB GTT seen).
   * Benchmark on an idle box; single runs are +-5%, the first run after an image
     switch can read ~10% low.
 """
@@ -137,6 +144,7 @@ class Entry:
     threads: int | None = None
     n_cpu_moe: int | None = None
     lazy_mode: str | None = None
+    load_mode: str | None = None
     caps_in: list[str] = field(default_factory=list)
     caps_out: list[str] = field(default_factory=list)
     unlisted: bool = False
@@ -207,6 +215,7 @@ _FLAGS: dict[str, tuple[str, type | None]] = {
     "--threads": ("threads", int), "-t": ("threads", int),
     "--n-cpu-moe": ("n_cpu_moe", int), "-ncmoe": ("n_cpu_moe", int),
     "--lazy-mode": ("lazy_mode", None), "-lzm": ("lazy_mode", None),
+    "--load-mode": ("load_mode", None), "-lm": ("load_mode", None),
 }
 
 
@@ -769,12 +778,12 @@ class Preset:
     def body(self, model: str, entry: Entry, opts: argparse.Namespace) -> dict:
         n_predict = opts.n_predict or self.n_predict
         common = {"n_predict": n_predict, "ignore_eos": self.fixed_len, "cache_prompt": False, "id_slot": 0}
-        if self.name in ("prose", "json", "prefill"):
-            if self.name == "prefill":
-                n = opts.prefill_tokens
+        if self.name in ("prose", "json", "prefill", "depth"):
+            if self.name in ("prefill", "depth"):
+                n = opts.prefill_tokens if self.name == "prefill" else opts.depth_tokens
                 if entry.ctx and n > entry.ctx - 1024:
                     n = entry.ctx - 1024
-                    warn(f"{entry.key}: prefill capped to {n} tokens (ctx {entry.ctx})")
+                    warn(f"{entry.key}: {self.name} capped to {n} tokens (ctx {entry.ctx})")
                 prompt = prefill_prompt(n)
             else:
                 prompt = PROSE_PROMPT if self.name == "prose" else JSON_PROMPT
@@ -805,6 +814,7 @@ PRESETS: dict[str, Preset] = {p.name: p for p in [
     Preset("tools", "chat", 256, False, "single tool call, natural stop; col: call/finish"),
     Preset("reasoning", "chat", 512, True, "enable_thinking on; col: think"),
     Preset("prefill", "completion", 16, True, "pure big-context prefill (--prefill-tokens, default 32768)"),
+    Preset("depth", "completion", 256, True, "decode at depth: 256 tokens after a --depth-tokens prompt (default 32768); col: depth"),
 ]}
 
 
@@ -979,6 +989,8 @@ def measure(target: Target, entry: Entry, preset: Preset, opts: argparse.Namespa
     t = d.get("timings") or {}
     if preset.name == "prefill":
         extras["ttft"] = f"{t.get('prompt_ms', 0) / 1000:.1f}s"
+    if preset.name == "depth":
+        extras["depth"] = t.get("prompt_n")
     return t, h, extras
 
 
@@ -998,8 +1010,9 @@ def warmup(target: Target, sampled: bool) -> None:
 def preset_warmup(target: Target, entry: Entry, preset: Preset, opts: argparse.Namespace, sampled: bool) -> None:
     """A 16-token dry run of the preset's own request (the old bench-models did this:
     it primes the exact prefill shape and the draft model's state). Skipped for
-    prefill, whose whole point is the cold full-length prompt."""
-    if preset.name == "prefill":
+    prefill, whose whole point is the cold full-length prompt, and for depth (the
+    dry run would cost a second full prefill; warmup() already ran both shapes)."""
+    if preset.name in ("prefill", "depth"):
         return
     body = preset.body(target.model, entry, opts)
     body["n_predict"] = N_WARMUP
@@ -1085,6 +1098,14 @@ def kernel_argv(entry: Entry, gguf: str, opts: argparse.Namespace, binary: str) 
             argv += ["-ncmoe", str(entry.n_cpu_moe)]
         if entry.lazy_mode and entry.lazy_mode.startswith("on"):
             argv += ["-lzm", "on"]
+    # The entry's load mode applies to --std too: it changes WHERE the weights live,
+    # not how fast they run. Without it llama-bench falls back to llama.cpp's
+    # default (`auto` = mmap off when a device lacks mmap support, i.e. Vulkan) and
+    # copies every CPU-side tensor into pinned memory -- measured 2026-09-07 on
+    # Strix Halo: Qwen3.8-Flash-Next with --n-cpu-moe 30 hit 77 GiB GTT during load
+    # (the desktop-crash mechanism) where the same entry served at 45 GiB.
+    if entry.load_mode:
+        argv += ["-lm", entry.load_mode]
     argv += ["-r", str(opts.reps), "--progress", "-o", "json"]
     if opts.bench_args:
         argv += shlex.split(opts.bench_args)
@@ -1219,6 +1240,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--variant", choices=VARIANTS, help="llama.cpp build to use (--kernel/--standalone); default = the entry's binary")
     p.add_argument("--prompt", default="all", help="comma-separated presets or 'all' (default all)")
     p.add_argument("--prefill-tokens", type=int, default=32768, help="prefill preset size (capped to ctx-1024)")
+    p.add_argument("--depth-tokens", type=int, default=32768, help="depth preset: prompt length before the 256 measured tokens (capped to ctx-1024)")
     p.add_argument("--n-predict", type=int, help="override every preset's generated token count")
     p.add_argument("--repeat", type=int, default=1, help="measured runs per preset (median of t/s; hash from the first run)")
     p.add_argument("--format", choices=("table", "md", "json"), default="table")
