@@ -95,12 +95,10 @@
 ARG LLAMA_SWAP_COMMIT="main"
 
 # Open upstream llama-swap PRs merged on top, same rules as LLAMA_PATCHES
-# (closed PRs are skipped with a notice, conflicts fail the build):
-#   #1099 ui/playground: live per-turn generation stats in the Chat tab
-#         (prompt/thinking/answer tokens, speed, cache reuse, MTP acceptance,
-#         TTFT, context use -- the first thing you want when comparing quants
-#         or tuning flags)
-ARG LLAMA_SWAP_PATCHES="1099"
+# (closed PRs are skipped with a notice, conflicts fail the build). Empty since
+# 2026-09-07: #1099 (ui/playground live per-turn generation stats in the Chat
+# tab) merged upstream on 2026-09-07 and is in main.
+ARG LLAMA_SWAP_PATCHES=""
 
 # Cache key only: CI sets it to the PR heads' shas (scripts/resolve-refs.sh) so
 # an updated PR rebuilds llama-swap even though the PR list did not change.
@@ -194,6 +192,11 @@ ARG LLAMA_COMMIT="master"
 #          (2-3% on Qwen3.6 MoE upstream) -- approved
 #   #28253 type-aligned quantized GET_ROWS (correctness on views) -- approved
 #   #28457 small-M matmul tile selection for Qwen-shaped buckets (m=1/m=32)
+#   #28489 MMVQ path selection independent of batch size -- measured on an RX
+#          7900 XTX 2026-09-06 (together with #28507): llama-bench neutral, but
+#          server-level MoE decode with MTP +2-5 % (qwen36 prose 156.5 -> 164.5,
+#          json 191.5 -> 196.0, medians of 3) -- the small-M MTP verify batches
+#          take the MMVQ path. Dense qwen38 neutral. Changes output numerics.
 #   Models
 #   #28243 Qwen3.8-Flash-Next MTP draft head + draft-only sidecar loading
 #          (unsloth's upstream PR; supersedes the local #27836/#28097 rebases)
@@ -211,13 +214,14 @@ ARG LLAMA_COMMIT="master"
 #   #25592 exact-position checkpoint restore for hybrid/recurrent models
 #          (agentic multi-turn @130k: 35 s -> 1.3 s turn restore) -- to benchmark
 # Retired as merged upstream: #28068 (GDN norm max->rsqrt, merged 2026-09-06).
-# Measured and NOT adopted: #25483 (MoE coopmat skip, +0.3%), #26284 + #26301
+# Measured and NOT adopted: #28507 (FA shared-memory staging on the RDNA scalar
+# path: neutral on a 7900 XTX at kernel and server level, 2026-09-06), #25483 (MoE coopmat skip, +0.3%), #26284 + #26301
 # (HIP MMQ tuning / mmvdq: +2% pp, decode same, and #26284 carries RDNA4
 # changes its maintainer wants dropped), #22970 (stale, conflicts with master).
 # patches/*.patch (local rebased patches) apply after the merges to both
 # backends; the directory is EMPTY since 2026-09-06 (see patches/README.md).
 # Retire PRs from the list as they merge (the build says so).
-ARG LLAMA_PATCHES="27952 28024 27220 28253 28457 28243 28265 28213 28136 28330 27210 28333 25592"
+ARG LLAMA_PATCHES="27952 28024 27220 28253 28457 28243 28265 28213 28136 28330 27210 28333 25592 28489"
 
 # Cache key only (see LLAMA_SWAP_PATCHES_HEADS).
 ARG LLAMA_PATCHES_HEADS=""

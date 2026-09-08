@@ -61,11 +61,25 @@ Things the numbers have taught us (keep in mind when reading a row):
     it Vulkan runs mmap OFF and pins every CPU-side tensor (77 GiB GTT seen).
   * Benchmark on an idle box; single runs are +-5%, the first run after an image
     switch can read ~10% low.
+  * acc     -- vision presets only: how much the model got RIGHT, which no other
+               preset measures (the text presets grade throughput and use `hash`
+               only as a did-anything-change check). The images are rendered by
+               this script from fixed tables, so the score is comparable across
+               models, builds and boxes -- but only within one version of this
+               file: change an image or a question and every old acc row becomes
+               incomparable. Rerun the sweep instead. `--vision-answers` prints
+               what each model actually replied, which is the part worth reading.
+
+Vision presets are NOT part of `all` (most entries have no image input); ask for
+them with --prompt vision (both), vision-ocr / vision-vqa, or full (text+vision).
+An entry without "image" in capabilities.in skips them with a warning.
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as _dt
+import difflib
 import glob
 import hashlib
 import json
@@ -76,10 +90,12 @@ import shlex
 import shutil
 import socket
 import statistics
+import struct
 import subprocess
 import sys
 import threading
 import time
+import zlib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -554,6 +570,267 @@ def fmt_gib(mib: int) -> str:
     return f"{mib / 1024:.1f}G"
 
 
+# ── vision test images (self-contained: no PIL/ImageMagick in the image) ─────
+# Every vision preset renders its own PNGs at run time from the tables below,
+# so the benchmark has no binary assets and the images are bit-identical on
+# every box and every image build (the accuracy scores are only comparable if
+# the input is). `--vision-dump DIR` writes them out to look at.
+#
+# FONT5X7: a 5x7 bitmap font, one entry per glyph, seven base32 digits = seven
+# 5-bit rows (bit 4 = leftmost pixel). Rendered at scale 4-12, so a glyph is
+# 20-60 px tall — coarse but crisp, and every VLM tested reads it. To eyeball a
+# glyph: for r in FONT5X7["A"]: print(f"{_B32.index(r):05b}".replace("0"," ").replace("1","#"))
+FONT5X7 = {
+    '0':'EHJLPHE', '1':'4C4444E', '2':'EH1248V', '3':'V2421HE', '4':'26AIV22', '5':'VGU11HE',
+    '6':'68GUHHE', '7':'V124888', '8':'EHHEHHE', '9':'EHHF12C', 'A':'4AHHVHH', 'B':'UHHUHHU',
+    'C':'EHGGGHE', 'D':'SIHHHIS', 'E':'VGGUGGV', 'F':'VGGUGGG', 'G':'EHGJHHE', 'H':'HHHVHHH',
+    'I':'E44444E', 'J':'72222IC', 'K':'HIKOKIH', 'L':'GGGGGGV', 'M':'HRLLHHH', 'N':'HHPLJHH',
+    'O':'EHHHHHE', 'P':'UHHUGGG', 'Q':'EHHHLID', 'R':'UHHUKIH', 'S':'FGGE11U', 'T':'V444444',
+    'U':'HHHHHHE', 'V':'HHHHHA4', 'W':'HHHLLRH', 'X':'HHA4AHH', 'Y':'HHA4444', 'Z':'V1248GV',
+    ' ':'0000000', '.':'00000CC', ',':'0000CC8', ':':'0CC0CC0', '-':'000V000', '/':'11248GG',
+    '#':'AAVAVAA', '$':'4FKE5U4', '%':'PQ48JB0', '(':'48GGG84', ')':'4211124', '=':'00V0V00',
+    '+':'044V440', '*':'0LEVEL0',
+}
+_B32 = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+BLACK, RED, BLUE, GREEN, GREY = (0, 0, 0), (208, 32, 32), (32, 80, 208), (32, 160, 64), (200, 200, 200)
+
+
+class Canvas:
+    """Minimal RGB raster + a hand-rolled PNG encoder (zlib is stdlib)."""
+
+    def __init__(self, w: int, h: int, bg: tuple = (255, 255, 255)):
+        self.w, self.h = w, h
+        self.px = bytearray(bytes(bg) * (w * h))
+
+    def rect(self, x: int, y: int, w: int, h: int, c: tuple) -> None:
+        for yy in range(max(0, y), min(self.h, y + h)):
+            row = yy * self.w * 3
+            for xx in range(max(0, x), min(self.w, x + w)):
+                self.px[row + xx * 3: row + xx * 3 + 3] = bytes(c)
+
+    def frame(self, x: int, y: int, w: int, h: int, c: tuple, t: int = 2) -> None:
+        self.rect(x, y, w, t, c)
+        self.rect(x, y + h - t, w, t, c)
+        self.rect(x, y, t, h, c)
+        self.rect(x + w - t, y, t, h, c)
+
+    def disc(self, cx: int, cy: int, r: int, c: tuple) -> None:
+        for yy in range(cy - r, cy + r + 1):
+            dy = yy - cy
+            if abs(dy) <= r:
+                dx = int((r * r - dy * dy) ** 0.5)
+                self.rect(cx - dx, yy, 2 * dx + 1, 1, c)
+
+    def tri_up(self, cx: int, by: int, w: int, h: int, c: tuple) -> None:
+        """Upward isosceles triangle: apex at (cx, by - h), base of width w at y = by."""
+        for i in range(h):
+            half = int(w / 2 * (i / max(1, h - 1)))
+            self.rect(cx - half, by - h + 1 + i, 2 * half + 1, 1, c)
+
+    def text(self, x: int, y: int, s: str, scale: int = 4, c: tuple = BLACK) -> None:
+        for ch in s.upper():
+            for ry, code in enumerate(FONT5X7.get(ch, FONT5X7[" "])):
+                bits = _B32.index(code)
+                for rx in range(5):
+                    if bits >> (4 - rx) & 1:
+                        self.rect(x + rx * scale, y + ry * scale, scale, scale, c)
+            x += 6 * scale
+
+    def png(self) -> bytes:
+        raw = bytearray()
+        for y in range(self.h):
+            raw.append(0)                       # filter type 0 (none) per scanline
+            raw += self.px[y * self.w * 3:(y + 1) * self.w * 3]
+
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", self.w, self.h, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+                + chunk(b"IEND", b""))
+
+
+# The receipt is the OCR ground truth: mechanical, unambiguous, and the
+# arithmetic is CONSISTENT on purpose (2x12.50 + 34.00 + 5x0.85 + 3x21.40 +
+# 18.75 = 146.20, +23% tax = 179.83) so a model cannot "helpfully" correct it.
+DOC_LINES = [
+    "NORTHGATE HARDWARE",
+    "INVOICE 48213 / 2026-03-14",
+    "",
+    "QTY ITEM          UNIT   AMOUNT",
+    "------------------------------",
+    "2   BRASS HINGE   12.50   25.00",
+    "1   OAK PLANK     34.00   34.00",
+    "5   STEEL SCREW    0.85    4.25",
+    "3   PAINT CAN     21.40   64.20",
+    "1   TAPE MEASURE  18.75   18.75",
+    "------------------------------",
+    "SUBTOTAL                 146.20",
+    "TAX 23%                   33.63",
+    "TOTAL                    179.83",
+]
+CHART_BARS = [("A", 25), ("B", 15), ("C", 40), ("D", 50), ("E", 30)]
+DIGIT_GRID = [[3, 8, 1, 6], [9, 4, 5, 2], [7, 0, 8, 3], [2, 6, 9, 1]]
+
+
+def _img_doc() -> Canvas:
+    scale, adv, lh = 4, 24, 40
+    c = Canvas(80 + adv * 31, 80 + lh * len(DOC_LINES))
+    for i, line in enumerate(DOC_LINES):
+        c.text(40, 40 + i * lh, line, scale)
+    return c
+
+
+def _img_scene() -> Canvas:
+    c = Canvas(800, 600, (242, 242, 242))
+    for x, y in ((60, 60), (300, 200), (120, 380)):     # 3 red squares
+        c.rect(x, y, 100, 100, RED)
+    for cx, cy in ((560, 120), (660, 330)):             # 2 blue circles
+        c.disc(cx, cy, 55, BLUE)
+    c.tri_up(380, 530, 170, 140, GREEN)                 # 1 green triangle
+    c.text(620, 460, "7", 12, BLACK)                    # one big glyph
+    return c
+
+
+def _img_chart() -> Canvas:
+    c = Canvas(800, 560)
+    x0, y0, unit = 120, 470, 8
+    for v in range(0, 51, 10):
+        y = y0 - v * unit
+        c.rect(x0, y, 560, 2, GREY)
+        c.text(x0 - 80, y - 10, f"{v:>2}", 3)
+    c.rect(x0, y0 - 50 * unit, 3, 50 * unit + 3, BLACK)
+    c.rect(x0, y0, 560, 3, BLACK)
+    for i, (name, v) in enumerate(CHART_BARS):
+        bx = x0 + 40 + i * 105
+        c.rect(bx, y0 - v * unit, 70, v * unit, BLUE)
+        c.text(bx + 20, y0 + 20, name, 4)
+    c.text(x0, 30, "UNITS PER SITE", 4)
+    return c
+
+
+def _img_grid() -> Canvas:
+    cell, m = 120, 40
+    c = Canvas(m * 2 + cell * 4, m * 2 + cell * 4)
+    for r, row in enumerate(DIGIT_GRID):
+        for col, d in enumerate(row):
+            x, y = m + col * cell, m + r * cell
+            c.frame(x, y, cell, cell, (120, 120, 120), 2)
+            c.text(x + 40, y + 32, str(d), 8)
+    return c
+
+
+IMAGES = {"doc": _img_doc, "scene": _img_scene, "chart": _img_chart, "grid": _img_grid}
+_IMG_CACHE: dict[str, str] = {}
+
+
+def image_data_url(name: str) -> str:
+    """PNG -> data: URL, rendered once per process (the raster loops are pure Python)."""
+    if name not in _IMG_CACHE:
+        png = IMAGES[name]().png()
+        _IMG_CACHE[name] = "data:image/png;base64," + base64.b64encode(png).decode()
+    return _IMG_CACHE[name]
+
+
+# ── vision grading ───────────────────────────────────────────────────────────
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").upper()).strip()
+
+
+def _nums(s: str) -> list[str]:
+    return re.findall(r"\d+\.\d+|\d+", s.replace(" ", ""))
+
+
+def g_first_num(expected: str):
+    """First number in the answer must equal `expected` (models answer '3', '3 squares',
+    'There are 3 ...' — all fine; '3 red and 2 blue' is still graded on the 3)."""
+    def grade(out: str) -> float:
+        n = _nums(_norm(out))
+        return 1.0 if n and n[0] == expected else 0.0
+    return grade
+
+
+def g_contains(*subs: str):
+    def grade(out: str) -> float:
+        t = _norm(out)
+        return 1.0 if any(s in t for s in subs) else 0.0
+    return grade
+
+
+def g_letter(expected: str):
+    def grade(out: str) -> float:
+        m = re.search(r"\b([A-E])\b", _norm(out))
+        return 1.0 if m and m.group(1) == expected else 0.0
+    return grade
+
+
+def _ocr_key(s: str) -> str:
+    """Formatting-insensitive OCR comparison key: letters/digits/decimal points only.
+    Whitespace, the ruler dashes and any markdown fences drop out, so a model is not
+    punished for reflowing the columns."""
+    return re.sub(r"[^A-Z0-9.%]", "", (s or "").upper())
+
+
+def g_ocr(out: str) -> float:
+    """Character F1 against the receipt: recall punishes missed/misread text, precision
+    punishes preamble and hallucinated lines. 1.0 = a perfect transcription."""
+    tgt, got = _ocr_key("\n".join(DOC_LINES)), _ocr_key(out)
+    if not got:
+        return 0.0
+    matched = sum(b.size for b in difflib.SequenceMatcher(None, tgt, got, autojunk=False)
+                  .get_matching_blocks())
+    prec, rec = matched / len(got), matched / len(tgt)
+    return 0.0 if prec + rec == 0 else 2 * prec * rec / (prec + rec)
+
+
+@dataclass
+class VisionCase:
+    name: str
+    image: str
+    question: str
+    truth: str                    # ground truth, for the --list-vision listing
+    grade: object                 # str -> float in [0, 1]
+    system: str = ("Answer the question about the image. Give only the answer, "
+                   "no explanation and no units.")
+    n_predict: int = 64
+
+    def body(self, model: str) -> dict:
+        return {"model": model, "stream": False, "n_predict": self.n_predict,
+                "ignore_eos": False, "cache_prompt": False, "id_slot": 0,
+                "messages": [
+                    {"role": "system", "content": self.system},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": image_data_url(self.image)}},
+                        {"type": "text", "text": self.question}]}]}
+
+
+_OCR_SYSTEM = ("You are an OCR engine. Transcribe the image exactly as printed, "
+               "line by line. Output only the transcription.")
+
+VISION_CASES: dict[str, VisionCase] = {c.name: c for c in [
+    VisionCase("ocr", "doc", "Transcribe this receipt.", "the 14 printed lines",
+               g_ocr, system=_OCR_SYSTEM, n_predict=512),
+    VisionCase("total", "doc", "What is the TOTAL on this receipt?", "179.83",
+               g_first_num("179.83")),
+    VisionCase("qty", "doc", "How many STEEL SCREW units were bought?", "5",
+               g_first_num("5")),
+    VisionCase("squares", "scene", "How many red squares are in the image?", "3",
+               g_first_num("3")),
+    VisionCase("triangle", "scene", "What colour is the triangle?", "green",
+               g_contains("GREEN")),
+    VisionCase("bigdigit", "scene", "What single digit is printed in the bottom-right corner?",
+               "7", g_first_num("7")),
+    VisionCase("tallest", "chart", "Which bar is the tallest? Answer with its letter.", "D",
+               g_letter("D")),
+    VisionCase("barvalue", "chart", "What is the value of bar C?", "40", g_first_num("40")),
+    VisionCase("cell", "grid", "The image is a 4x4 grid of digits. Rows are numbered 1-4 from "
+               "the top and columns 1-4 from the left. Which digit is in row 2, column 3?",
+               "5", g_first_num("5")),
+]}
+VISION_OCR_CASES = ("ocr",)
+VISION_VQA_CASES = ("total", "qty", "squares", "triangle", "bigdigit", "tallest", "barvalue", "cell")
+
 # ── presets ──────────────────────────────────────────────────────────────────
 PROSE_PROMPT = (
     "The lighthouse keeper climbed the spiral staircase for the last time. "
@@ -774,8 +1051,15 @@ class Preset:
     n_predict: int
     fixed_len: bool
     note: str
+    cases: tuple = ()         # vision presets: VISION_CASES keys, one request each
 
     def body(self, model: str, entry: Entry, opts: argparse.Namespace) -> dict:
+        if self.cases:        # only the FIRST case -- used by preset_warmup; the
+            # measured requests are built per case in measure_vision()
+            b = VISION_CASES[self.cases[0]].body(model)
+            if opts.n_predict:
+                b["n_predict"] = opts.n_predict
+            return b
         n_predict = opts.n_predict or self.n_predict
         common = {"n_predict": n_predict, "ignore_eos": self.fixed_len, "cache_prompt": False, "id_slot": 0}
         if self.name in ("prose", "json", "prefill", "depth"):
@@ -815,18 +1099,28 @@ PRESETS: dict[str, Preset] = {p.name: p for p in [
     Preset("reasoning", "chat", 512, True, "enable_thinking on; col: think"),
     Preset("prefill", "completion", 16, True, "pure big-context prefill (--prefill-tokens, default 32768)"),
     Preset("depth", "completion", 256, True, "decode at depth: 256 tokens after a --depth-tokens prompt (default 32768); col: depth"),
+    Preset("vision-ocr", "chat", 512, False, "full-page OCR of a rendered receipt; col: acc (character F1)",
+           cases=VISION_OCR_CASES),
+    Preset("vision-vqa", "chat", 64, False, "8 short visual questions (count/colour/chart/grid/OCR field); "
+           "col: acc (graded answers)", cases=VISION_VQA_CASES),
 ]}
+TEXT_PRESETS = [n for n, p in PRESETS.items() if not p.cases]
+VISION_PRESETS = [n for n, p in PRESETS.items() if p.cases]
+# group name -> preset names. `all` stays text-only (it is what every historic
+# LLM_BENCHMARK.md row was produced with, and most entries take no image).
+PRESET_GROUPS = {"all": TEXT_PRESETS, "vision": VISION_PRESETS, "full": TEXT_PRESETS + VISION_PRESETS}
 
 
 def parse_presets(spec: str) -> list[Preset]:
-    if spec == "all":
-        return list(PRESETS.values())
-    out = []
-    for name in spec.split(","):
-        name = PROMPT_ALIASES.get(name.strip(), name.strip())
-        if name not in PRESETS:
-            raise UserError(f"unknown preset '{name}' (have: {', '.join(PRESETS)}, all)")
-        out.append(PRESETS[name])
+    out: list[Preset] = []
+    for token in spec.split(","):
+        name = PROMPT_ALIASES.get(token.strip(), token.strip())
+        for n in PRESET_GROUPS.get(name, [name]):
+            if n not in PRESETS:
+                raise UserError(f"unknown preset '{n}' (have: {', '.join(PRESETS)}; "
+                                f"groups: {', '.join(PRESET_GROUPS)})")
+            if PRESETS[n] not in out:
+                out.append(PRESETS[n])
     return out
 
 
@@ -955,9 +1249,62 @@ def token_counters(target: Target | None) -> tuple[int, int] | None:
     return vals[_METRICS[0]], vals[_METRICS[1]]
 
 
+def measure_vision(target: Target, entry: Entry, preset: Preset, opts: argparse.Namespace,
+                   sampled: bool) -> tuple[dict, str, dict]:
+    """One request PER CASE -> (synthetic timings, hash, extras).
+
+    The timings dict carries the same keys measure() returns, medianed over the
+    cases (pp/tg) or summed (token counts), so bench_server needs no special
+    case: a vision row's t/s is the typical per-question rate, and `tok` is the
+    total generated. Accuracy is the point of the row and lands in extras:
+      acc   mean case score, 0-100% (character F1 for ocr, right/wrong otherwise)
+      ptok  median prompt tokens per case -- how many tokens THIS model spends on
+            the same image; qwen35-* (dynamic ViT + --image-min-tokens) and
+            lfm25-vl (SigLIP2 NaFlex) differ by a lot, and it explains their pp
+      miss  cases scored below 0.5, by name
+    """
+    scores, ts, texts, misses = [], [], [], []
+    for name in preset.cases:
+        case = VISION_CASES[name]
+        body = case.body(target.model)
+        if opts.n_predict:
+            body["n_predict"] = opts.n_predict
+        if not sampled:
+            body.update(GREEDY)
+        d = target.post("/v1/chat/completions", body)
+        msg = d["choices"][0]["message"]
+        text = (msg.get("content") or "").strip()
+        score = float(case.grade(text))
+        scores.append(score)
+        if score < 0.5:
+            misses.append(name)
+        ts.append(d.get("timings") or {})
+        texts.append(text)
+        if opts.vision_answers:
+            print(f"  [{target.model} {name}] score {score:.2f} truth={case.truth!r}\n"
+                  f"    {text[:600]!r}", file=sys.stderr, flush=True)
+
+    def med(key: str) -> float:
+        return statistics.median(t.get(key, 0) or 0 for t in ts)
+    timings = {"prompt_per_second": med("prompt_per_second"),
+               "predicted_per_second": med("predicted_per_second"),
+               "prompt_n": sum(t.get("prompt_n", 0) or 0 for t in ts),
+               "predicted_n": sum(t.get("predicted_n", 0) or 0 for t in ts),
+               "draft_n": sum(t.get("draft_n", 0) or 0 for t in ts),
+               "draft_n_accepted": sum(t.get("draft_n_accepted", 0) or 0 for t in ts)}
+    extras = {"acc": f"{100 * statistics.mean(scores):.0f}%",
+              "ptok": str(int(med("prompt_n")))}
+    if misses:
+        extras["miss"] = ",".join(misses)
+    h = hashlib.sha256("\n".join(texts).encode()).hexdigest()[:12]
+    return timings, h, extras
+
+
 def measure(target: Target, entry: Entry, preset: Preset, opts: argparse.Namespace,
             sampled: bool) -> tuple[dict, str, dict]:
     """One measured request -> (timings, hash, extras)."""
+    if preset.cases:
+        return measure_vision(target, entry, preset, opts, sampled)
     body = preset.body(target.model, entry, opts)
     extras: dict = {}
     if sampled:
@@ -1033,6 +1380,13 @@ def bench_server(target: Target, entry: Entry, presets: list[Preset], opts: argp
                  emit, guard: Guard, metrics_target: Target | None) -> list[Row]:
     rows: list[Row] = []
     params = entry.params(params_extra)
+    if any(p.cases for p in presets) and "image" not in entry.caps_in:
+        for p in [p for p in presets if p.cases]:
+            warn(f"{entry.key}: no image input (capabilities.in={entry.caps_in or '-'}), "
+                 f"skipping preset {p.name}")
+        presets = [p for p in presets if not p.cases]
+        if not presets:
+            return rows
     try:
         warmup(target, sampled)
     except Exception as ex:  # load failure: one FAILED row for the whole model
@@ -1226,9 +1580,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="benchmark", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Benchmark llama-swap text entries (server-level), their GGUFs (llama-bench) "
                     "or a standalone llama-server variant.",
-        epilog="presets:\n" + "\n".join(f"  {n:<10} {p.note}" for n, p in PRESETS.items())
-               + "\n\nexamples:\n  benchmark qwen38                      # all presets, via llama-swap\n"
+        epilog="presets:\n" + "\n".join(f"  {n:<12} {p.note}" for n, p in PRESETS.items())
+               + "\ngroups:\n" + "\n".join(f"  {n:<12} {', '.join(v)}" for n, v in PRESET_GROUPS.items())
+               + "\n\nexamples:\n  benchmark qwen38                      # all text presets, via llama-swap\n"
                  "  benchmark --prompt prose,json qwen38 qwen38-hh\n"
+                 "  benchmark --prompt vision --vision-answers qwen35-4b qwen35-2b lfm25-vl\n"
                  "  benchmark --kernel --std --unload qwen38\n"
                  "  benchmark --standalone --variant rocm --unload qwen38\n"
                  "  benchmark --sampled qwen38:l\n  benchmark --list")
@@ -1238,7 +1594,12 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--sampled", action="store_true", help="via llama-swap /v1/chat/completions with filters (production sampling)")
     mode.add_argument("--list", action="store_true", help="list parsed llama-server entries, no requests")
     p.add_argument("--variant", choices=VARIANTS, help="llama.cpp build to use (--kernel/--standalone); default = the entry's binary")
-    p.add_argument("--prompt", default="all", help="comma-separated presets or 'all' (default all)")
+    p.add_argument("--prompt", default="all",
+                   help="comma-separated presets or a group: all (text, default), vision, full")
+    p.add_argument("--vision-answers", action="store_true",
+                   help="print every vision case's answer and score to stderr")
+    p.add_argument("--vision-dump", metavar="DIR",
+                   help="write the generated test PNGs to DIR and exit (no requests)")
     p.add_argument("--prefill-tokens", type=int, default=32768, help="prefill preset size (capped to ctx-1024)")
     p.add_argument("--depth-tokens", type=int, default=32768, help="depth preset: prompt length before the 256 measured tokens (capped to ctx-1024)")
     p.add_argument("--n-predict", type=int, help="override every preset's generated token count")
@@ -1278,6 +1639,17 @@ def main() -> int:
     opts = build_parser().parse_args()
     if opts.variant and not (opts.kernel or opts.standalone):
         raise UserError("--variant only applies to --kernel / --standalone")
+    if opts.vision_dump:
+        os.makedirs(opts.vision_dump, exist_ok=True)
+        for name, build in IMAGES.items():
+            c = build()
+            path = os.path.join(opts.vision_dump, f"{name}.png")
+            with open(path, "wb") as f:
+                f.write(c.png())
+            print(f"{path}  {c.w}x{c.h}")
+        for c in VISION_CASES.values():
+            print(f"{c.name:<9} {c.image:<6} truth={c.truth!r}  q={c.question}")
+        return 0
     cfg = Config(opts.config)
     if opts.list:
         cmd_list(cfg)

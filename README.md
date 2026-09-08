@@ -2,7 +2,7 @@
 
 The [llama-swap](https://github.com/mostlygeek/llama-swap) `unified-vulkan` image rebuilt from source for AMD hardware: the same binary names, config location and port, so a config written for upstream's image works here, but with **both GPU stacks**, everything at its **current upstream revision**, and the open PRs worth having merged in:
 
-- **llama-swap itself built from source** — current `main` plus open upstream PRs (`LLAMA_SWAP_PATCHES`, today [#1099](https://github.com/mostlygeek/llama-swap/pull/1099): live per-turn generation stats in the Playground Chat), web UI embedded, `vllm-wrapper` from the same tree. It is *the* `llama-swap` binary, not a side binary.
+- **llama-swap itself built from source** — current `main` plus any open upstream PRs worth having (`LLAMA_SWAP_PATCHES`, empty at the moment — #1099, live per-turn generation stats in the Playground Chat, merged upstream 2026-09-07), web UI embedded, `vllm-wrapper` from the same tree. It is *the* `llama-swap` binary, not a side binary.
 - **llama.cpp from current master plus open upstream PRs** (`LLAMA_PATCHES`: Vulkan fusions and int8 coopmat matmul, Qwen 3.5/3.6/3.8 fixes, Qwen3.8-Flash-Next MTP, adaptive MTP, exact checkpoint restore — see [Upstream PRs in the llama.cpp build](#upstream-prs-in-the-llamacpp-build)), the **same tree for the Vulkan and the ROCm build**. There is no un-patched llama.cpp in the image: `llama-server` is the patched build.
 - **Vulkan** (Mesa RADV) — works on practically any AMD GPU, including RDNA1/2, iGPUs/APUs and anything ROCm doesn't cover. Built with a modern shader compiler (see [Why build the Vulkan binaries ourselves](#why-build-the-vulkan-binaries-ourselves)) and shipped with a **current Mesa/RADV** instead of Ubuntu 24.04's.
 - **ROCm 7.14** (HIP) — the full ROCm userspace runtime (HIP, rocBLAS/hipBLAS, hipBLASLt, `rocminfo`) plus HIP builds of the engines, with flash-attention kernels for every KV-cache quant. ROCm comes from AMD's per-gfx `packages-multi-arch` repository (`ROCM_CHANNEL=multiarch`), so the image carries BLAS kernels only for the gfx targets it is built for instead of ~6 GB of all-arch Tensile blobs; the classic `repo.radeon.com` channel (tops out at ROCm 7.2.4, which still has the HIP-graphs bug fixed in 7.13) remains available as `ROCM_CHANNEL=classic`.
@@ -70,14 +70,14 @@ Build args:
 | Arg | Default | Purpose |
 |---|---|---|
 | `LLAMA_SWAP_COMMIT` | `main` | llama-swap revision to build `llama-swap` and `vllm-wrapper` from (sha, tag such as `v255`, or branch). |
-| `LLAMA_SWAP_PATCHES` | `1099` | Space-separated open upstream llama-swap PR numbers merged on top; same drift rules as `LLAMA_PATCHES`. The version string becomes e.g. `v255-2-g1a2b3c+pr1099`. |
+| `LLAMA_SWAP_PATCHES` | *(empty)* | Space-separated open upstream llama-swap PR numbers merged on top; same drift rules as `LLAMA_PATCHES`. The version string gets a `+prN` suffix per merged PR, e.g. `v255-2-g1a2b3c+pr1099` (that PR merged upstream 2026-09-07 and was retired). |
 | `WITH_ROCM` | `true` | `false` builds the Vulkan-only image (no HIP stages, no ROCm runtime); CI uses this for `:vulkan` |
 | `ROCM_CHANNEL` | `multiarch` | ROCm source: `multiarch` = repo.amd.com per-gfx packages (current releases, small runtime — kernels only for `AMDGPU_TARGETS`); `classic` = repo.radeon.com apt + `rocm/dev-ubuntu-24.04` builder (max 7.2.4, all-arch kernels, HIP-graphs bug — pair it with `GGML_CUDA_DISABLE_GRAPHS=1` at runtime) |
 | `ROCM_SERIES` | `7.14` | multiarch channel: release series in the package names (`amdrocm-runtime7.14`, ...); apt resolves the newest point release of the series |
 | `ROCM_VERSION` | `7.2.4` | classic channel: builder image tag and apt repo path |
 | `AMDGPU_TARGETS` | `gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201` | gfx architectures compiled into the HIP binaries (RDNA2/3/3.5/4). CDNA (`gfx908;gfx90a;gfx942`) is not included by default — add it if you run Instinct cards. Trim to just your GPU for a much faster build. |
 | `LLAMA_COMMIT` | `master` | llama.cpp revision for both the Vulkan and the ROCm build (sha, tag, branch, or `refs/pull/N/head`). |
-| `LLAMA_PATCHES` | 13 PRs, see below | Space-separated upstream llama.cpp PR numbers merged on top of `LLAMA_COMMIT`, for both backends, fetched over git as `refs/pull/N/head`. A PR that is closed on GitHub is skipped with a notice; one that no longer merges cleanly fails the build — never a silent no-op. `patches/*.patch` (local rebased patches, empty since 2026-09-06) apply on top. See [Upstream PRs in the llama.cpp build](#upstream-prs-in-the-llamacpp-build). |
+| `LLAMA_PATCHES` | 14 PRs, see below | Space-separated upstream llama.cpp PR numbers merged on top of `LLAMA_COMMIT`, for both backends, fetched over git as `refs/pull/N/head`. A PR that is closed on GitHub is skipped with a notice; one that no longer merges cleanly fails the build — never a silent no-op. `patches/*.patch` (local rebased patches, empty since 2026-09-06) apply on top. See [Upstream PRs in the llama.cpp build](#upstream-prs-in-the-llamacpp-build). |
 | `WHISPER_COMMIT` / `SD_COMMIT` / `AUDIOCPP_COMMIT` | `master` / `master` / `main` | Revision of the other engines (sha, tag or branch). |
 | `GLSLC_SUITE` | `resolute` | Ubuntu release whose `glslc`/`libshaderc1` are used by the Vulkan builder (only those two packages; everything else stays 24.04) |
 | `LLAMA_FA_ALL_QUANTS` | `ON` | ROCm llama.cpp: compile flash-attention kernels for all K/V cache quant combinations (without it only q8_0/q8_0 and q4_0/q4_0 stay on the GPU, see llama.cpp #27761). Set `OFF` for a faster build. |
@@ -135,6 +135,7 @@ Until 2026-09-06 there were two Vulkan builds — a "pure" `llama-server` with o
 | [#27220](https://github.com/ggml-org/llama.cpp/pull/27220) | Vulkan | UNARY+MUL fusion (MoE shared-expert gating) | approved by jeffbolznv |
 | [#28253](https://github.com/ggml-org/llama.cpp/pull/28253) | Vulkan | type-aligned quantized GET_ROWS | approved ×4 |
 | [#28457](https://github.com/ggml-org/llama.cpp/pull/28457) | Vulkan | small-M matmul tiles for Qwen buckets | new |
+| [#28489](https://github.com/ggml-org/llama.cpp/pull/28489) | Vulkan | MMVQ path selection independent of batch size (+2-5 % MoE decode with MTP, measured) | new |
 | [#28243](https://github.com/ggml-org/llama.cpp/pull/28243) | models | Qwen3.8-Flash-Next MTP + draft-only sidecar (unsloth) | draft, ggerganov reviewing |
 | [#28265](https://github.com/ggml-org/llama.cpp/pull/28265) | models | Qwen3.5-family delta-net out-proj 2D (+6-9% batched TG on Strix Halo) | open |
 | [#28213](https://github.com/ggml-org/llama.cpp/pull/28213) | models | qwen4exp QSA gather decode | open |
@@ -152,8 +153,9 @@ Measured on an RX 7900 XTX with this image (Mesa 26.1, llama-bench, q8_0/q4_0 KV
 | [#25483](https://github.com/ggml-org/llama.cpp/pull/25483) | Vulkan: skip unneeded MoE work in coopmat1 mul_mm | +0.3% | +0.2% | unchanged | not worth a patch |
 | [#26284](https://github.com/ggml-org/llama.cpp/pull/26284) + [#26301](https://github.com/ggml-org/llama.cpp/pull/26301) | HIP: RDNA3 MMQ tuning + dequant-float matvec | ROCm 977 → 1000 (+2%, within noise) | +2% | unchanged | not adopted (#26284 still carries RDNA4 changes its reviewer wants removed; re-test when merged) |
 | [#22970](https://github.com/ggml-org/llama.cpp/pull/22970) | Vulkan K-quant A-matrix transpose | – | – | – | stale, conflicts with master |
+| [#28507](https://github.com/ggml-org/llama.cpp/pull/28507) + [#28489](https://github.com/ggml-org/llama.cpp/pull/28489) | Vulkan FA shmem staging (RDNA scalar path) + batch-independent MMVQ | 908.7 → 906.5 | 4018 → 4029 | kernel unchanged; server MoE+MTP decode +2-5 % | **#28489 in the set**, #28507 not adopted (neutral) |
 
-The same mechanism serves llama-swap: `LLAMA_SWAP_PATCHES` (default [#1099](https://github.com/mostlygeek/llama-swap/pull/1099), live generation stats in the Playground Chat) is merged into `LLAMA_SWAP_COMMIT` and the result is compiled with the UI embedded, exactly as upstream's release build does (`make linux-amd64`). Retire PRs from either list as they merge — the build says so.
+The same mechanism serves llama-swap: `LLAMA_SWAP_PATCHES` is merged into `LLAMA_SWAP_COMMIT` and the result is compiled with the UI embedded, exactly as upstream's release build does (`make linux-amd64`). The list is empty right now — its one entry, [#1099](https://github.com/mostlygeek/llama-swap/pull/1099) (live generation stats in the Playground Chat), merged upstream on 2026-09-07. Retire PRs from either list as they merge — the build says so.
 
 ## Run
 
@@ -210,7 +212,7 @@ docker run --rm --device /dev/dri --entrypoint llama-bench \
 # Versions baked into the image (every commit, merged PR and build option)
 docker run --rm --entrypoint cat ghcr.io/selfref/llama-swap-docker-amd:latest /versions.txt
 
-# llama-swap version (e.g. v255-2-g1a2b3c+pr1099: base release + merged PRs)
+# llama-swap version (e.g. v255-2-g1a2b3c, plus a +prN suffix per merged PR)
 docker run --rm ghcr.io/selfref/llama-swap-docker-amd:latest -version
 ```
 
@@ -228,6 +230,7 @@ docker compose exec llama-swap benchmark --kernel --std --unload qwen38      # l
 docker compose exec llama-swap benchmark --standalone --variant rocm --unload qwen38   # this entry on the ROCm build
 docker compose exec llama-swap benchmark --standalone --variant engram --unload qwen38-fl  # ... on EngramHalo (:full)
 docker compose exec llama-swap benchmark --sampled qwen38:l      # production sampling + filters (not comparable)
+docker compose exec llama-swap benchmark --prompt vision --vision-answers qwen35-4b lfm25-vl   # vision: accuracy + speed
 docker compose exec llama-swap benchmark --list                  # parsed entries, no requests
 ```
 
@@ -245,6 +248,33 @@ transcript, 6 tools, ~2.5k prompt tokens; column `call`), `tools` (single tool c
 `--prefill-tokens`, default 32768 capped to the entry's context; `tok` is the real prompt length,
 `ttft` the prompt time), `depth` (decode speed for 256 tokens after a `--depth-tokens` prompt, default 32768 --
 where attention variants and speculative acceptance differ most; column `depth`). `--format md` prints rows for a markdown log, `--format json` for diffing.
+
+### Vision presets
+
+Two presets measure the multimodal path, and they are the only ones that grade whether the answer
+is *right* rather than just how fast it arrived. They are **not** in `all` (most entries take no
+image); ask for them by name, as the group `vision`, or take everything with `full`. An entry
+without `image` in `capabilities.in` skips them with a warning.
+
+| Preset | Request | Columns |
+|---|---|---|
+| `vision-ocr` | one image, "transcribe this receipt", natural stop (cap 512 tokens) | `acc` = character F1 against the printed text (recall punishes misreads, precision punishes preamble/hallucination) |
+| `vision-vqa` | eight short questions over four images: receipt total, a line-item quantity, counting shapes, a shape's colour, one big glyph, a bar chart's tallest bar, a bar's value, a cell in a 4x4 digit grid | `acc` = graded answers, `miss` = which cases failed |
+
+Both also report `ptok`, the median prompt tokens the model spent on the same image — a
+dynamic-resolution ViT with `--image-min-tokens 2048` and a NaFlex encoder differ by several
+thousand tokens on identical input, which is most of the explanation for their `pp t/s`.
+
+The four test images (a receipt, a shapes scene, a bar chart, a digit grid) are **rendered by the
+script itself** from tables in its source — a hand-rolled PNG encoder plus a 5x7 bitmap font, pure
+stdlib, no PIL in the image and no binary assets in this repo — so they are bit-identical on every
+box and every build. `--vision-dump DIR` writes them out to look at, together with each case's
+question and ground truth. `--vision-answers` prints what each model actually replied, per case,
+which is the part worth reading when a score drops.
+
+Accuracy rows are comparable only *within one version of this file*: editing an image, a question
+or a grader invalidates every earlier `acc` number, so re-run the sweep rather than comparing
+across a change.
 
 Notes: the tool holds the box while it runs -- a watcher thread polls llama-swap's `/running` and
 immediately unloads any model that is not the one under test (other services' requests fail for
