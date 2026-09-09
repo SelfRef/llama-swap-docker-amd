@@ -20,7 +20,8 @@
 #
 # Every input defaults to the Dockerfile's ARG default and can be overridden
 # from the environment: LLAMA_COMMIT LLAMA_PATCHES WHISPER_COMMIT SD_COMMIT
-# AUDIOCPP_COMMIT LLAMA_SWAP_COMMIT LLAMA_SWAP_PATCHES ENGRAM_REPO ENGRAM_BRANCH.
+# AUDIOCPP_COMMIT LLAMA_SWAP_COMMIT LLAMA_SWAP_PATCHES ENGRAM_REPO ENGRAM_BRANCH
+# FPX_REPO FPX_BRANCH.
 # A ref may be a branch, a tag, a full sha or refs/pull/N/head.
 set -euo pipefail
 
@@ -88,6 +89,7 @@ emit AUDIOCPP_COMMIT         "$(resolve "$AUDIOCPP_REPO" "$(val AUDIOCPP_COMMIT)
 emit LLAMA_SWAP_COMMIT       "$(resolve "$LLAMA_SWAP_REPO" "$(val LLAMA_SWAP_COMMIT)")"
 emit LLAMA_SWAP_PATCHES_HEADS "$(pr_heads "$LLAMA_SWAP_REPO" "$LLAMA_SWAP_PATCHES")"
 emit ENGRAM_COMMIT           "$(resolve "$(val ENGRAM_REPO)" "$(val ENGRAM_BRANCH)")"
+emit FPX_COMMIT              "$(resolve "$(val FPX_REPO)" "$(val FPX_BRANCH)")"
 emit BUILD_DATE              "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # The PR lists themselves contain spaces; in --docker mode (unquoted $(...) in a
 # shell) they would split into separate words, so they are only printed in

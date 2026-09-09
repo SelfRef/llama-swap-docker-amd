@@ -23,6 +23,10 @@
 #       whisper-server-rocm, whisper-cli-rocm, sd-server-rocm, sd-cli-rocm
 #   - EngramHalo.cpp (Aristo94's Strix Halo/qwen4exp fork of llama.cpp, HIP,
 #     gfx1151 only) as *-engram binaries -- see the WITH_ENGRAM arg below
+#   - LaurentZuijdwijk's llama.cpp fork (Vulkan) as *-fpx binaries: it adds the
+#     ROCmFPx weight formats (ROCmFP4 & co., GGUF types stock llama.cpp cannot
+#     load), kernels tuned for the batch widths speculative decoding verifies
+#     at, and adaptive draft sizing -- see the WITH_FPX arg below
 #   - Vulkan builds of llama.cpp, whisper.cpp, sd.cpp and audio.cpp with a
 #     MODERN glslc. Upstream builds them on Ubuntu 24.04 with its stock glslc
 #     (shaderc 2023.8 / glslang 14), which cannot compile the
@@ -73,9 +77,10 @@
 # was built, with the PRs merged, is recorded in /versions.txt.
 #
 # Layout: llama.cpp is installed as self-contained directories
-# /opt/llama-vulkan, /opt/llama-rocm and /opt/llama-engram (binaries + their
-# shared libs, RPATH $ORIGIN, ggml backends discovered next to the executable)
-# with symlinks in /usr/local/bin, so the builds never share a libggml.
+# /opt/llama-vulkan, /opt/llama-rocm, /opt/llama-engram and /opt/llama-fpx
+# (binaries + their shared libs, RPATH $ORIGIN, ggml backends discovered next
+# to the executable) with symlinks in /usr/local/bin, so the builds never
+# share a libggml.
 # whisper/sd/audio.cpp binaries are static.
 #
 # Build:
@@ -213,6 +218,22 @@ ARG LLAMA_COMMIT="master"
 #   #28333 zero the MTP carrier at sequence start (determinism across requests)
 #   #25592 exact-position checkpoint restore for hybrid/recurrent models
 #          (agentic multi-turn @130k: 35 s -> 1.3 s turn restore) -- to benchmark
+# Trimmed on 2026-09-09 against master d4abd573 (dry-run merge of the whole
+# list; the two dropped PRs were FATAL for the build, not optional):
+#   retired as merged upstream: #28024, #27220, #28253 (and #28068 on 09-06).
+#   #27952 (int8 coopmat1) DROPPED -- no longer merges (conflict in
+#          ggml-vulkan.cpp). It is the one with measured value on RDNA3
+#          (pp512 +4.6% dense / +18.5% MoE; qwen36 server prefill 850 -> 1098
+#          t/s on 08-29), so PUT IT BACK the moment it merges upstream (it has
+#          an approval) or rebase it into patches/. Until then MoE prefill on
+#          this box is ~15% lower than the 09-06 image.
+#   #28136 (lazy PLE direct reads) DROPPED -- no longer merges (conflict in
+#          tools/llama-bench/llama-bench.cpp). NOTE this removes the
+#          `--lazy-mode on-direct` VALUE from llama-server: master only has
+#          on/auto/off, so any config using on-direct fails to start (the
+#          cloud repo's qwen38-flash entry was moved to `--lazy-mode on` in
+#          the same commit). Measured throughput-neutral with a warm page
+#          cache -- it only optimises cold start.
 # Retired as merged upstream: #28068 (GDN norm max->rsqrt, merged 2026-09-06).
 # Measured and NOT adopted: #28507 (FA shared-memory staging on the RDNA scalar
 # path: neutral on a 7900 XTX at kernel and server level, 2026-09-06), #25483 (MoE coopmat skip, +0.3%), #26284 + #26301
@@ -221,10 +242,53 @@ ARG LLAMA_COMMIT="master"
 # patches/*.patch (local rebased patches) apply after the merges to both
 # backends; the directory is EMPTY since 2026-09-06 (see patches/README.md).
 # Retire PRs from the list as they merge (the build says so).
-ARG LLAMA_PATCHES="27952 28024 27220 28253 28457 28243 28265 28213 28136 28330 27210 28333 25592 28489"
+ARG LLAMA_PATCHES="28457 28243 28265 28213 28330 27210 28333 25592 28489"
 
 # Cache key only (see LLAMA_SWAP_PATCHES_HEADS).
 ARG LLAMA_PATCHES_HEADS=""
+
+# ── ROCmFPx fork (LaurentZuijdwijk/llama.cpp) ──────────────────────────
+# A SECOND Vulkan llama.cpp install (/opt/llama-fpx, *-fpx binaries) from
+# LaurentZuijdwijk's fork of llama.cpp, which upstream cannot replace because
+# it adds new GGUF tensor types:
+#
+#   - the ROCmFPx weight formats (Q4_0_ROCMFP4 / _FAST / Q2/Q3/Q6/Q8_0_ROCMFPX,
+#     ggml type ids 100-107, hand-ported from ciru-ai/ROCmFPX <- charlie12345/
+#     ROCmFPX where the format originates) with CPU codecs plus Vulkan dequant,
+#     mat-vec, matmul and integer-dot kernels. Stock llama.cpp cannot LOAD these
+#     files at all (`Q4_0_ROCMFP4_FAST` is GGUF file type 103).
+#   - a reworked batch-3..8 mat-vec path (whole-block MMVQ for the FP4 types,
+#     branch-free fp6/fp3 dequant, an IQ3_S register-spill fix) -- exactly the
+#     widths speculative decoding verifies at.
+#   - `--spec-draft-adaptive` / `--spec-draft-n-min`: draft length follows the
+#     measured acceptance rate instead of a fixed `--spec-draft-n-max`.
+#   - Vulkan prefill tuning that also pays on stock K-quants: an LDS bank-conflict
+#     fix in the coopmat matmul tile stride (driver-gated to RADV >= 25.3), f16 B
+#     operand for quantized matmul/matmul_id, a tiled concat-transpose for the
+#     delta-net conv state.
+#
+# Measured here on an RX 7900 XTX (gfx1100, RADV/Mesa 26.2.2, 2026-09-09,
+# full tables in the cloud repo's LLM_BENCHMARK.md) -- Qwen3.8-27B with its
+# baked MTP head, greedy prose / json / refactor decode t/s:
+#   stock llama-server, unsloth UD-Q4_K_XL (16.35 GiB), n-max 3
+#       60.9 / 83.6 / 94.7   prefill 423 / 328 / 777   VRAM 22.3 G  PPL 6.637
+#   llama-server-fpx, julianmb ROCmFP4-FAST (13.55 GiB, 4.25 bpw), n-max 4
+#       76.7 / 105.5 / 128.0 prefill 457 / 343 / 921   VRAM 19.0 G  PPL 6.921
+# i.e. +26 / +26 / +35 % decode and -3.3 GiB for +4.3 % perplexity. The FP4
+# format is a software codebook, NOT hardware FP4 (no RDNA GPU has FP4 matrix
+# instructions): the decode win is bytes moved per token plus those batch-3..8
+# kernels. On the same card the fork's engine work alone, on the same K-quant
+# file, is +5-7 % prefill and neutral decode -- so the file, not the binary, is
+# where most of it comes from; both are needed.
+#
+# Vulkan-only on purpose: the fork ships no HIP kernels for these types. It is
+# built in BOTH published tags (nothing here needs the ROCm runtime). The fork
+# tracks upstream by merging master periodically, so it lags a few weeks; keep
+# `llama-server` the default engine and use this one per config entry.
+ARG WITH_FPX=true
+ARG FPX_REPO=https://github.com/LaurentZuijdwijk/llama.cpp.git
+ARG FPX_BRANCH=master
+ARG FPX_COMMIT=""
 
 # ── EngramHalo.cpp ─────────────────────────────────────────────────────
 # EngramHalo.cpp: Aristo94's llama.cpp fork tuned for Qwen 3.8 Flash-Next on
@@ -385,6 +449,105 @@ done
   echo "llama_patches: $(cat .merged-prs)";
   echo "llama_local_patches: $(cat .local-patches)";
   echo "vulkan_glslc: $(glslc --version | head -1)"; } > /install/build-info/llama-vulkan
+BUILD
+
+# ── Build the ROCmFPx fork (Vulkan) ────────────────────────────────────
+# Second Vulkan llama.cpp install -> /opt/llama-fpx, *-fpx binaries. Same
+# toolchain, cmake flags and relocatable layout as the llama-vulkan stage
+# above; see the WITH_FPX arg for what the fork adds and why upstream cannot
+# replace it. llama-quantize and llama-perplexity come along because they are
+# the only way to PRODUCE and score a ROCmFPx file (from a BF16/F16 source:
+# `llama-quantize-fpx in.gguf out.gguf Q4_0_ROCMFP4_STRIX_LEAN`) -- no other
+# binary in this image knows these types.
+
+FROM vulkan-builder AS llama-fpx
+ARG FPX_REPO
+ARG FPX_BRANCH
+ARG FPX_COMMIT
+RUN --mount=type=cache,id=ccache-vulkan,target=/ccache <<'BUILD'
+#!/bin/bash
+set -euo pipefail
+
+REF="${FPX_COMMIT:-${FPX_BRANCH}}"
+echo "=== Cloning the ROCmFPx fork (${FPX_BRANCH} @ ${REF}) ==="
+mkdir -p /src/llama-fpx && cd /src/llama-fpx
+git init -q
+git remote add origin "${FPX_REPO}"
+git fetch --depth=1 origin "${REF}"
+git checkout -q FETCH_HEAD
+echo "fork at $(git rev-parse HEAD)"
+
+echo "=== glslc feature tests (llama.cpp's own) ==="
+for t in integer_dot bfloat16 coopmat; do
+    f="ggml/src/ggml-vulkan/vulkan-shaders/feature-tests/$t.comp"
+    [ -f "$f" ] || { echo "(no feature test $t in this revision, skipping)"; continue; }
+    if glslc -o /dev/null -fshader-stage=compute --target-env=vulkan1.3 "$f" >/dev/null 2>&1; then
+        echo "  $t: OK"
+    else
+        echo "FATAL: glslc cannot compile $f -- the Vulkan build would lose that code path" >&2
+        exit 1
+    fi
+done
+
+echo "=== Building the ROCmFPx fork (Vulkan) ==="
+cmake -B build \
+    -DGGML_NATIVE=OFF \
+    -DGGML_VULKAN=ON \
+    -DBUILD_SHARED_LIBS=ON \
+    -DGGML_BACKEND_DL=ON \
+    -DGGML_CPU_ALL_VARIANTS=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+    -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+    2>&1 | tee /tmp/configure-fpx.log
+for ext in GL_EXT_integer_dot_product GL_EXT_bfloat16 GL_KHR_cooperative_matrix; do
+    line=$(grep -i "$ext" /tmp/configure-fpx.log || true)
+    echo "  cmake: ${line:-<no message for $ext>}"
+    if grep -qi "not supported" <<<"$line"; then
+        echo "FATAL: CMake reports $ext unsupported by glslc" >&2; exit 1; fi
+done
+cmake --build build --config Release -j"$(nproc)"
+
+echo "=== Collecting ==="
+OUT=/install/llama-fpx
+mkdir -p "$OUT" /install/build-info
+for bin in llama-server llama-cli llama-bench llama-quantize llama-perplexity; do
+    [ -f "build/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
+    cp "build/bin/$bin" "$OUT/${bin}-fpx"
+done
+cp -P build/bin/*.so* "$OUT/"
+ls "$OUT"/libggml-cpu-*.so >/dev/null 2>&1 || { echo "FATAL: no ggml-cpu variants built" >&2; exit 1; }
+ls "$OUT"/libggml-vulkan.so >/dev/null 2>&1 || { echo "FATAL: libggml-vulkan.so not built" >&2; exit 1; }
+# Same relocatable check as the llama-vulkan stage.
+for f in "$OUT"/*; do
+    [ -L "$f" ] && continue
+    rp=$(readelf -d "$f" 2>/dev/null | awk '/RUNPATH|RPATH/ {gsub(/[\[\]]/,"",$NF); print $NF}')
+    if [ -n "$rp" ] && { [[ "$rp" != '$ORIGIN'* ]] || [[ "$rp" == */src/* ]]; }; then
+        echo "FATAL: $f has run path '$rp' (expected \$ORIGIN[:...])" >&2; exit 1; fi
+    if ldd "$f" 2>/dev/null | grep -q "not found"; then
+        echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
+done
+# The whole point of this stage: the ROCmFPx tensor types and adaptive
+# drafting must be present. If a later upstream merge in the fork drops
+# either, this build fails instead of silently shipping a plain llama.cpp
+# under the -fpx name (config entries that reference these files would then
+# fail to load a model at runtime).
+# (both binaries print their help to stdout and EXIT 1, so capture first --
+# a `cmd | grep` would fail the build through `pipefail`, not through grep.)
+QHELP=$("$OUT/llama-quantize-fpx" --help 2>&1 || true)
+grep -q 'Q4_0_ROCMFP4_FAST' <<<"$QHELP" || {
+    echo "FATAL: llama-quantize-fpx does not know the ROCmFPx types -- the fork lost them" >&2
+    head -5 <<<"$QHELP" >&2; exit 1; }
+SHELP=$("$OUT/llama-server-fpx" --help 2>&1 || true)
+grep -q -- '--spec-draft-adaptive' <<<"$SHELP" || {
+    echo "FATAL: llama-server-fpx has no --spec-draft-adaptive -- the fork lost adaptive drafting" >&2; exit 1; }
+{ echo "llama_fpx_commit: $(git rev-parse HEAD) (${FPX_REPO} @ ${FPX_BRANCH})";
+  echo "llama_fpx_types: $(sed -n 's/^ *[0-9]* *or *\(Q[0-9]_[0-9]_ROCM[A-Z0-9_]*\) .*/\1/p' <<<"$QHELP" | sort -u | tr '\n' ' ')"; } \
+  > /install/build-info/llama-fpx
 BUILD
 
 # ── Build whisper.cpp (Vulkan) ─────────────────────────────────────────
@@ -981,6 +1144,18 @@ FROM rocm-none    AS llama-engram-false-true
 FROM rocm-none    AS llama-engram-false-false
 FROM llama-engram-${WITH_ROCM}-${WITH_ENGRAM} AS llama-engram-sel
 
+# ── ROCmFPx fork selection (WITH_FPX) ──────────────────────────────────
+# Vulkan-only, so this switch is independent of WITH_ROCM and the stage is
+# built for BOTH published tags. Its own empty stand-in keeps the two knobs
+# separable (rocm-none exists only to serve the ROCm side).
+
+FROM alpine:3 AS fpx-none
+RUN mkdir -p /install/llama-fpx /install/build-info
+
+FROM llama-fpx AS llama-fpx-true
+FROM fpx-none  AS llama-fpx-false
+FROM llama-fpx-${WITH_FPX} AS llama-fpx-sel
+
 # ══════════════════════════════════════════════════════════════════════
 # ── Final image: Ubuntu 24.04 runtime (+ ROCm) + everything built above ──
 
@@ -994,6 +1169,7 @@ ARG QWEN_TEMPLATE_URL
 ARG QWEN_SHARP_TEMPLATE_URL
 ARG WITH_ROCM
 ARG WITH_ENGRAM
+ARG WITH_FPX
 
 LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-docker-amd" \
       org.opencontainers.image.description="llama-swap unified image for AMD GPUs (ROCm + Vulkan)"
@@ -1088,6 +1264,7 @@ COPY --from=llama-rocm-sel   /install/llama-rocm/ /opt/llama-rocm/
 COPY --from=whisper-rocm-sel /install/bin/ /usr/local/bin/
 COPY --from=sd-rocm-sel      /install/bin/ /usr/local/bin/
 COPY --from=llama-engram-sel /install/llama-engram/ /opt/llama-engram/
+COPY --from=llama-fpx-sel    /install/llama-fpx/ /opt/llama-fpx/
 # build-info of every stage -> /versions.txt below
 COPY --from=llama-vulkan     /install/build-info/ /tmp/build-info/
 COPY --from=whisper-vulkan   /install/build-info/ /tmp/build-info/
@@ -1098,6 +1275,7 @@ COPY --from=llama-rocm-sel   /install/build-info/ /tmp/build-info/
 COPY --from=whisper-rocm-sel /install/build-info/ /tmp/build-info/
 COPY --from=sd-rocm-sel      /install/build-info/ /tmp/build-info/
 COPY --from=llama-engram-sel /install/build-info/ /tmp/build-info/
+COPY --from=llama-fpx-sel    /install/build-info/ /tmp/build-info/
 RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
         ln -sf "/opt/llama-vulkan/$bin" "/usr/local/bin/$bin"; \
         if [ "${WITH_ROCM}" = "true" ]; then \
@@ -1110,6 +1288,11 @@ RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
             ln -sf "/opt/llama-engram/$bin-engram" "/usr/local/bin/$bin-engram"; \
         done; \
     else rmdir /opt/llama-engram; fi \
+    && if [ "${WITH_FPX}" = "true" ]; then \
+        for bin in llama-server llama-cli llama-bench llama-quantize llama-perplexity; do \
+            ln -sf "/opt/llama-fpx/$bin-fpx" "/usr/local/bin/$bin-fpx"; \
+        done; \
+    else rmdir /opt/llama-fpx; fi \
     && ldconfig
 
 # Example config with both backends; override by mounting /etc/llama-swap/config
@@ -1156,6 +1339,10 @@ if [ "${WITH_ROCM}" = "true" ] && [ "${WITH_ENGRAM}" = "true" ]; then
     BINS="$BINS llama-server-engram llama-cli-engram llama-bench-engram"
     SERVERS="$SERVERS llama-server-engram"
 fi
+if [ "${WITH_FPX}" = "true" ]; then
+    BINS="$BINS llama-server-fpx llama-cli-fpx llama-bench-fpx llama-quantize-fpx llama-perplexity-fpx"
+    SERVERS="$SERVERS llama-server-fpx"
+fi
 for bin in $BINS; do
     out=$(ldd "$(readlink -f "$(command -v "$bin")")")
     if grep -q 'not found' <<<"$out"; then
@@ -1164,7 +1351,7 @@ for bin in $BINS; do
         exit 1
     fi
 done
-for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*) $([ -d /opt/llama-engram ] && echo /opt/llama-engram/*.so*); do
+for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*) $([ -d /opt/llama-engram ] && echo /opt/llama-engram/*.so*) $([ -d /opt/llama-fpx ] && echo /opt/llama-fpx/*.so*); do
     if ldd "$lib" | grep -q 'not found'; then
         echo "FATAL: $lib has unresolved libraries" >&2; ldd "$lib" | grep 'not found' >&2; exit 1; fi
 done
@@ -1215,7 +1402,7 @@ first() { awk -v k="$1" '$1==k {print $2; exit}' "/tmp/build-info/$2"; }
   fi
   echo "mesa_vulkan_drivers: $(dpkg-query -W -f '${Version}' mesa-vulkan-drivers) (${MESA_PPA:-ubuntu})"
   echo "cpu_variants: $(ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ')"
-  for f in llama-swap llama-vulkan llama-rocm llama-engram whisper-vulkan whisper-rocm sd-vulkan sd-rocm audiocpp; do
+  for f in llama-swap llama-vulkan llama-rocm llama-engram llama-fpx whisper-vulkan whisper-rocm sd-vulkan sd-rocm audiocpp; do
     [ -f "/tmp/build-info/$f" ] && cat "/tmp/build-info/$f"
   done
   echo "qwen_chat_template: $(grep -o 'template_version = "[^"]*"' /etc/llama-swap/templates/qwen-fixed.jinja | head -1 | cut -d'"' -f2) (${QWEN_TEMPLATE_URL})"

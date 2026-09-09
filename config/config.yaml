@@ -6,8 +6,10 @@
 # Pick per model whichever backend suits your GPU. audio.cpp (audiocpp_server)
 # is Vulkan-only. Both llama.cpp builds are current master plus the open
 # upstream PRs listed in the Dockerfile (LLAMA_PATCHES); `llama-server-engram`
-# (Strix Halo fork, :full tag only) is the third llama.cpp. Full config
-# reference: https://github.com/mostlygeek/llama-swap/wiki/Configuration
+# (Strix Halo fork, :full tag only) and `llama-server-fpx` (ROCmFPx fork, both
+# tags -- the only build that can load ROCmFP4/ROCmFPx weight files) are the
+# other two llama.cpp installs. Full config reference:
+# https://github.com/mostlygeek/llama-swap/wiki/Configuration
 
 healthCheckTimeout: 300
 logRequests: true
@@ -28,6 +30,20 @@ models:
       -hf unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M
       --port ${PORT}
       -ngl 999
+
+  # ROCmFPx fork: the ROCmFP4 weight formats stock llama.cpp cannot load, plus
+  # adaptive draft sizing. On an RX 7900 XTX, Qwen3.8-27B ROCmFP4-FAST with the
+  # model's own MTP head decodes ~26-35% faster than the same model as
+  # UD-Q4_K_XL on `llama-server`, in 3.3 GiB less VRAM (see the WITH_FPX arg in
+  # the Dockerfile for the numbers and the quality cost).
+  "qwen38-fp4":
+    cmd: >
+      llama-server-fpx
+      -hf julianmb/Qwen-3.8-27B-ROCmFP4-FAST-GGUF:FAST
+      --port ${PORT}
+      -ngl 999
+      --flash-attn on
+      --spec-type draft-mtp --spec-draft-n-max 4
 
   "whisper":
     checkEndpoint: /v1/audio/transcriptions/

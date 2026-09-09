@@ -129,7 +129,7 @@ GREEDY = {"temperature": 0, "top_k": 1, "seed": 42, "id_slot": 0}
 STANDARD_BENCH = ["-fa", "1", "-ctk", "q8_0", "-ctv", "q4_0", "-b", "2048", "-ub", "512",
                   "-p", "512", "-n", "128", "-d", "0,8192"]
 FIT_MARGIN_MIB = 1024  # llama-server's --fit on default margin (1 GiB)
-VARIANTS = ("vulkan", "rocm", "engram")
+VARIANTS = ("vulkan", "rocm", "engram", "fpx")
 SIDECAR_PREFIXES = ("mmproj-", "mtp-", "dflash-", "eagle3-", "dspark-")
 PROMPT_ALIASES = {"story": "prose", "code": "json"}
 
@@ -1484,7 +1484,7 @@ def bench_kernel(entry: Entry, opts: argparse.Namespace, variant: str, swap: Swa
     if not shutil.which(binary):
         have = sorted(os.path.basename(p) for d in os.environ["PATH"].split(":")
                       for p in glob.glob(os.path.join(d, "llama-bench*")))
-        row.error = f"{binary} not in this image (have: {', '.join(have) or 'none'}; -rocm/-engram only in the :full tag)"
+        row.error = f"{binary} not in this image (have: {', '.join(have) or 'none'}; -rocm/-engram only in the :full tag, -fpx needs WITH_FPX)"
         return row
     try:
         gguf = resolve_gguf(entry)
