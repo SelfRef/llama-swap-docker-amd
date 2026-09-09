@@ -224,24 +224,26 @@ the mounted llama-swap `config.yaml` and prints one table: model, the parameters
 
 ```sh
 docker compose exec llama-swap benchmark                         # every listed text entry, all presets
-docker compose exec llama-swap benchmark qwen38 qwen38-hh        # server-level, via llama-swap
+docker compose exec llama-swap benchmark qwen38 qwen38-hh        # via llama-swap, production sampling + filters
+docker compose exec llama-swap benchmark qwen38:l                # a reasoning alias, with its filters
+docker compose exec llama-swap benchmark --greedy qwen38 qwen38-hh   # deterministic greedy body via /upstream (hash-comparable)
+docker compose exec llama-swap benchmark --prompt fast qwen38     # quick smoke test: prose, json, tools
 docker compose exec llama-swap benchmark --prompt prose,prefill --prefill-tokens 65536 qwen38-fl
 docker compose exec llama-swap benchmark --kernel --std --unload qwen38      # llama-bench, community-comparable line
 docker compose exec llama-swap benchmark --standalone --variant rocm --unload qwen38   # this entry on the ROCm build
 docker compose exec llama-swap benchmark --standalone --variant engram --unload qwen38-fl  # ... on EngramHalo (:full)
-docker compose exec llama-swap benchmark --sampled qwen38:l      # production sampling + filters (not comparable)
 docker compose exec llama-swap benchmark --prompt vision --vision-answers qwen35-4b lfm25-vl   # vision: accuracy + speed
 docker compose exec llama-swap benchmark --list                  # parsed entries, no requests
 ```
 
 | Mode | What runs | What it tells you |
 |---|---|---|
-| server (default) | greedy requests through `/upstream/<model>/` (real entry flags: MTP, mmproj, `--parallel`, KV types; llama-swap filters bypassed) | what users get |
+| sampled (default) | llama-swap's `/v1/chat/completions` with the entry's filters (production sampling, aliases like `:l` allowed) | what users get; hash blank, not comparable with greedy |
+| `--greedy` | greedy requests through `/upstream/<model>/` (real entry flags: MTP, mmproj, `--parallel`, KV types; llama-swap filters bypassed, aliases resolve to the parent) | deterministic throughput + output hash for build/config A/Bs |
 | `--kernel` | `llama-bench[-<variant>]` on the entry's cached GGUF with the entry's KV/batch/placement flags, or `--std` for `-fa 1 -ctk q8_0 -ctv q4_0 -b 2048 -ub 512 -p 512 -n 128 -d 0,8192` | hardware / driver / build (no speculative decoding, no mmproj) |
-| `--standalone --variant V` | spawns `llama-server-<V>` with the entry's exact cmd (host/port substituted), benches it like server mode, kills it | binary A/Bs without a temporary config entry |
-| `--sampled` | llama-swap's `/v1/chat/completions` with the entry's filters (aliases like `:l` allowed) | production sampling; hash blank, not comparable with greedy |
+| `--standalone --variant V` | spawns `llama-server-<V>` with the entry's exact cmd (host/port substituted), benches it like `--greedy`, kills it | binary A/Bs without a temporary config entry |
 
-Variants are `vulkan` (plain `llama-server`), `rocm` and `engram`. Presets (`--prompt`, default `all`): `prose` (free text, speculative worst case), `json` (structured
+Variants are `vulkan` (plain `llama-server`), `rocm` and `engram`. Presets (`--prompt`, default group `text`): `prose` (free text, speculative worst case), `json` (structured
 output, best case), `refactor` (copy-heavy code edit, ~2k-token module), `agent` (tool-calling
 transcript, 6 tools, ~2.5k prompt tokens; column `call`), `tools` (single tool call, natural stop;
 `call`/`finish`), `reasoning` (`enable_thinking` on; `think`), `prefill` (pure big-context prefill,
@@ -252,8 +254,10 @@ where attention variants and speculative acceptance differ most; column `depth`)
 ### Vision presets
 
 Two presets measure the multimodal path, and they are the only ones that grade whether the answer
-is *right* rather than just how fast it arrived. They are **not** in `all` (most entries take no
-image); ask for them by name, as the group `vision`, or take everything with `full`. An entry
+is *right* rather than just how fast it arrived. They are **not** in the default `text` group (most entries
+take no image); ask for them by name, as the group `vision`, or take everything with `all`.
+The group `fast` (`prose`, `json`, `tools`) is the smoke test: no 32k prompts and no 1k-token
+generation, about a minute per GPU entry, still showing both speculative extremes and a tool call. An entry
 without `image` in `capabilities.in` skips them with a warning.
 
 | Preset | Request | Columns |

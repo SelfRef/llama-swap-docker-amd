@@ -7,25 +7,29 @@ Run INSIDE the llama-swap container (baked to /usr/local/bin/benchmark):
 
 Four modes, one table:
 
-  SERVER (default)   Requests go through llama-swap's /upstream/<model>/ raw proxy,
-                     which swap-loads the entry exactly as production does (MTP,
-                     mmproj, --parallel, KV types ...) but skips the OpenAI-route
-                     filters (setParams would overwrite temperature and break
-                     determinism). Every measured request is GREEDY (temp 0,
-                     top_k 1, seed 42, cache_prompt off) with a fixed n_predict
-                     where that makes sense, so the numbers are pure throughput
-                     and the content hash is a determinism check.
+  SAMPLED (default)  Requests go through llama-swap's /v1/chat/completions, exactly
+                     as production traffic does: the entry swap-loads with its real
+                     flags (MTP, mmproj, --parallel, KV types ...) AND its filters
+                     apply (setParams sampling, :l/:m/:x reasoning aliases). This
+                     is the "what users get" number. Output is not deterministic,
+                     so the hash column is blank and rows are NOT comparable with
+                     --greedy rows.
+  --greedy           Through llama-swap's /upstream/<model>/ raw proxy, which
+                     swap-loads the same entry but skips the OpenAI-route filters
+                     (setParams would overwrite temperature and break determinism).
+                     Every measured request is GREEDY (temp 0, top_k 1, seed 42,
+                     cache_prompt off) with a fixed n_predict where that makes
+                     sense, so the numbers are pure throughput and the content
+                     hash is a determinism check for build/config A/Bs. Aliases
+                     resolve to their parent entry (no filters on this route).
   --kernel           llama-bench[-<variant>] on the entry's GGUF with the entry's
                      KV/batch/placement flags (or --std for the fixed community-
                      comparable line). No speculative decoding, no mmproj: this is
                      the "hardware/build" number, not the "what users get" number.
   --standalone       Spawn llama-server-<variant> with the entry's exact cmd (port
-                     and host substituted), bench it like SERVER mode, kill it.
+                     and host substituted), bench it like --greedy mode, kill it.
                      For binary A/Bs (Vulkan vs ROCm vs a patched build) without a
                      temporary config entry.
-  --sampled          Through llama-swap's /v1/chat/completions, so the entry's
-                     filters (production sampling, :l/:m/:x aliases) apply. NOT
-                     comparable with greedy rows; the hash column is blank.
 
 Things the numbers have taught us (keep in mind when reading a row):
   * accept  -- speculative entries only: draft tokens accepted / drafted. The gain
@@ -70,8 +74,10 @@ Things the numbers have taught us (keep in mind when reading a row):
                incomparable. Rerun the sweep instead. `--vision-answers` prints
                what each model actually replied, which is the part worth reading.
 
-Vision presets are NOT part of `all` (most entries have no image input); ask for
-them with --prompt vision (both), vision-ocr / vision-vqa, or full (text+vision).
+Vision presets are NOT part of the default `text` group (most entries have no image
+input); ask for them with --prompt vision (both), vision-ocr / vision-vqa, or all
+(text+vision). `fast` = prose, json, tools: the quick smoke test (no 32k prompts,
+no 1k-token generation) for "did this config/build change break or slow anything".
 An entry without "image" in capabilities.in skips them with a warning.
 """
 from __future__ import annotations
@@ -311,7 +317,7 @@ class Config:
             e = parent
             if not sampled:
                 warn(f"{name} is an alias of {e.key}; filters do not apply via /upstream, "
-                     f"benchmarking {e.key} (use --sampled to bench the alias itself)")
+                     f"benchmarking {e.key} (drop --greedy to bench the alias itself)")
                 name = e.key
         if not os.path.basename(e.binary).startswith("llama-server"):
             raise UserError(f"{e.key}: not a llama-server entry ({os.path.basename(e.binary)})")
@@ -1106,9 +1112,15 @@ PRESETS: dict[str, Preset] = {p.name: p for p in [
 ]}
 TEXT_PRESETS = [n for n, p in PRESETS.items() if not p.cases]
 VISION_PRESETS = [n for n, p in PRESETS.items() if p.cases]
-# group name -> preset names. `all` stays text-only (it is what every historic
-# LLM_BENCHMARK.md row was produced with, and most entries take no image).
-PRESET_GROUPS = {"all": TEXT_PRESETS, "vision": VISION_PRESETS, "full": TEXT_PRESETS + VISION_PRESETS}
+# group name -> preset names. `text` is the default sweep (it is what every historic
+# LLM_BENCHMARK.md row was produced with, and most entries take no image); `all` =
+# text + vision. Before 2026-09-08 the groups were called `all` (text) and `full` (both).
+# `fast` is the smoke-test subset: short prompts, <=512 generated tokens, no 32k
+# prefill/depth, no 1k-token copy task -- ~1 minute per GPU entry instead of ~5.
+# It still covers both speculative extremes (prose/json) and a tool-call check.
+FAST_PRESETS = ["prose", "json", "tools"]
+PRESET_GROUPS = {"text": TEXT_PRESETS, "fast": FAST_PRESETS, "vision": VISION_PRESETS,
+                 "all": TEXT_PRESETS + VISION_PRESETS}
 
 
 def parse_presets(spec: str) -> list[Preset]:
@@ -1578,24 +1590,31 @@ class Standalone:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="benchmark", formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Benchmark llama-swap text entries (server-level), their GGUFs (llama-bench) "
-                    "or a standalone llama-server variant.",
+        description="Benchmark llama-swap text entries (through llama-swap, production sampling by default), "
+                    "their GGUFs (llama-bench) or a standalone llama-server variant.",
         epilog="presets:\n" + "\n".join(f"  {n:<12} {p.note}" for n, p in PRESETS.items())
                + "\ngroups:\n" + "\n".join(f"  {n:<12} {', '.join(v)}" for n, v in PRESET_GROUPS.items())
-               + "\n\nexamples:\n  benchmark qwen38                      # all text presets, via llama-swap\n"
-                 "  benchmark --prompt prose,json qwen38 qwen38-hh\n"
+               + "\n\nexamples:\n  benchmark qwen38                      # all text presets, via llama-swap (production sampling)\n"
+                 "  benchmark qwen38:l                    # a reasoning alias, with its filters\n"
+                 "  benchmark --greedy --prompt prose,json qwen38 qwen38-hh   # deterministic, hash-comparable\n"
+                 "  benchmark --prompt fast qwen38        # ~1 min smoke test (prose, json, tools)\n"
                  "  benchmark --prompt vision --vision-answers qwen35-4b qwen35-2b lfm25-vl\n"
                  "  benchmark --kernel --std --unload qwen38\n"
                  "  benchmark --standalone --variant rocm --unload qwen38\n"
-                 "  benchmark --sampled qwen38:l\n  benchmark --list")
+                 "  benchmark --list")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--kernel", action="store_true", help="llama-bench on the entry's GGUF (hardware/build number)")
     mode.add_argument("--standalone", action="store_true", help="spawn llama-server-<variant> with the entry's cmd")
-    mode.add_argument("--sampled", action="store_true", help="via llama-swap /v1/chat/completions with filters (production sampling)")
+    mode.add_argument("--greedy", action="store_true",
+                      help="via llama-swap /upstream/<model>/ with a greedy body (deterministic, hash column filled; "
+                           "filters and aliases bypassed)")
+    mode.add_argument("--sampled", action="store_true",
+                      help="via llama-swap /v1/chat/completions with the entry's filters (production sampling) -- the default")
     mode.add_argument("--list", action="store_true", help="list parsed llama-server entries, no requests")
     p.add_argument("--variant", choices=VARIANTS, help="llama.cpp build to use (--kernel/--standalone); default = the entry's binary")
-    p.add_argument("--prompt", default="all",
-                   help="comma-separated presets or a group: all (text, default), vision, full")
+    p.add_argument("--prompt", default="text",
+                   help="comma-separated presets or a group: text (default), fast (prose,json,tools), "
+                        "vision, all (text+vision)")
     p.add_argument("--vision-answers", action="store_true",
                    help="print every vision case's answer and score to stderr")
     p.add_argument("--vision-dump", metavar="DIR",
@@ -1639,6 +1658,8 @@ def main() -> int:
     opts = build_parser().parse_args()
     if opts.variant and not (opts.kernel or opts.standalone):
         raise UserError("--variant only applies to --kernel / --standalone")
+    # llama-swap route modes: sampled (default) vs greedy; kernel/standalone bypass llama-swap
+    sampled = not (opts.greedy or opts.kernel or opts.standalone)
     if opts.vision_dump:
         os.makedirs(opts.vision_dump, exist_ok=True)
         for name, build in IMAGES.items():
@@ -1684,7 +1705,7 @@ def main() -> int:
     targets: list[tuple[Entry, str]] = []
     if opts.models:
         for name in opts.models:
-            targets.append(cfg.resolve(name, opts.sampled))
+            targets.append(cfg.resolve(name, sampled))
     else:
         targets = [(e, e.key) for e in cfg.text_entries()]
     if not targets:
@@ -1692,7 +1713,7 @@ def main() -> int:
 
     today = _dt.date.today().isoformat()
     ver = versions()
-    mode = "kernel" if opts.kernel else "standalone" if opts.standalone else "sampled" if opts.sampled else "server"
+    mode = "kernel" if opts.kernel else "standalone" if opts.standalone else "sampled" if sampled else "greedy"
     meta = {"date": today, "mode": mode, "presets": [p.name for p in presets], "repeat": opts.repeat,
             "n_predict": opts.n_predict, "prefill_tokens": opts.prefill_tokens,
             "llama_vulkan_commit": ver.get("llama_vulkan_commit", "?").split()[0],
@@ -1703,7 +1724,7 @@ def main() -> int:
         print(f"benchmark {today} mode={mode} presets={','.join(meta['presets'])} repeat={opts.repeat} "
               f"llama.cpp={meta['llama_vulkan_commit'][:8]}"
               + (f" prs={meta['llama_patches'].replace(' ', ',')}" if meta['llama_patches'] else "")
-              + (" SAMPLED -- not comparable with greedy rows" if opts.sampled else "") + "\n", flush=True)
+              + (" SAMPLED -- production sampling, not comparable with --greedy rows" if sampled else "") + "\n", flush=True)
         table.header()
 
     rows: list[Row] = []
@@ -1735,8 +1756,8 @@ def main() -> int:
                 table.row(r)
             rows += new
             continue
-        tgt = swap.openai(model) if opts.sampled else swap.upstream(entry.key)
-        rows += bench_server(tgt, entry, presets, opts, opts.sampled, None, baseline_gtt, uma,
+        tgt = swap.openai(model) if sampled else swap.upstream(entry.key)
+        rows += bench_server(tgt, entry, presets, opts, sampled, None, baseline_gtt, uma,
                              emit=table.row, guard=guard, metrics_target=swap.upstream(entry.key))
     guard.stop()
 
