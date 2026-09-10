@@ -190,8 +190,9 @@ ARG LLAMA_COMMIT="master"
 #   Vulkan backend
 #   #27952 int8 coopmat1 matmul for RDNA3/4 (0cc4m) -- measured on an RX 7900
 #          XTX: pp512 +4.6% dense (Q4_K_XL), +18.5% MoE (Qwen3.6-35B-A3B
-#          Q4_K_M), decode unchanged. Watch #25773 (mul_mm rewrite): when it
-#          lands, this one needs a rebase.
+#          Q4_K_M), decode unchanged. Dropped 2026-09-09 (conflict), RESTORED
+#          2026-09-10: #25773 (the mul_mm A-type spec constant it collided
+#          with) merged on 09-09 and the author rebased on top of it.
 #   #28024 rms_norm fusions (RMS_NORM+MUL+ADD, ROPE+VIEW+SET_ROWS) -- approved
 #   #27220 fuse UNARY(silu/gelu/sigmoid)+MUL incl. MoE shared-expert gating
 #          (2-3% on Qwen3.6 MoE upstream) -- approved
@@ -211,7 +212,11 @@ ARG LLAMA_COMMIT="master"
 #          @130k upstream claim; measured 0 on RADV 2026-09-02, kept for depth)
 #   #28136 direct pread()s for the lazy PLE/n-gram table (cold-start prefill;
 #          throughput-neutral when the page cache is warm)
-#   #28330 no V cache for the qwen4exp lightning indexer (pure VRAM win)
+#   #28699 incremental pooled-key cache for the qwen4exp QSA indexer -- the
+#          block summaries were regathered over the whole context every token
+#          in every QSA layer (the dominant decode-at-depth cost of
+#          qwen38-flash); env kill switch LLAMA_QSA_NO_POOLED_CACHE=1. Ported
+#          from the same fork the fpx binary comes from -- to benchmark
 #   Speculative / server
 #   #27210 `--spec-type draft-mtp-adaptive` (opt-in; R9700 Qwen3.8-27B code
 #          53->72 t/s vs fixed n-max 3) -- to benchmark
@@ -234,15 +239,43 @@ ARG LLAMA_COMMIT="master"
 #          cloud repo's qwen38-flash entry was moved to `--lazy-mode on` in
 #          the same commit). Measured throughput-neutral with a warm page
 #          cache -- it only optimises cold start.
+# Revised 2026-09-10 against master df03399b (dry-run merge of the whole list,
+# scripts/checkout-with-prs.sh on a local blobless clone -- all eight merge
+# cleanly, so this list is what the build will actually apply):
+#   retired as merged upstream: #28457 (small-M matmul, merged 09-10) and
+#          #28330 (no indexer V cache, merged 09-10). #28422 (topk_moe fusion
+#          for prefill), the one that had to be left out on 09-06, and #25773
+#          are in master too.
+#   #27952 RESTORED -- see above. It is the reason this revision exists: with
+#          prefill (not decode t/s) the thing being optimised since 09-10, it
+#          is the only patch with a measured pp win on this card, and MoE
+#          prefill (qwen36, ling3) has been ~15 % down since it was dropped.
+#   #28489 (MMVQ path selection) DROPPED -- no longer merges (conflict in
+#          ggml-vulkan.cpp, 09-06 head vs current master). Its measured value
+#          was +2-5 % MoE *decode*, nothing on prefill, so it is not worth a
+#          local rebase; re-add if the author refreshes it.
+#   #28092 (server --cache-disk, a prompt cache that survives a process
+#          restart) EVALUATED AND LEFT OUT: it conflicts with #25592 in
+#          tools/server/server-context.cpp and #25592 is the bigger TTFT win
+#          here (exact-position checkpoint restore, 35 s -> 1.3 s). Worth
+#          revisiting when either side rebases -- with llama-swap swapping
+#          processes on this box, a disk-backed prompt cache is the one
+#          remaining structural prefill saving.
 # Retired as merged upstream: #28068 (GDN norm max->rsqrt, merged 2026-09-06).
-# Measured and NOT adopted: #28507 (FA shared-memory staging on the RDNA scalar
+# Measured and NOT adopted: #28528 (Vulkan stream-k MUL_MAT: the shaders exist
+# for cm1 but the heuristic only enables them on coopmat2/NVIDIA, so it is a
+# no-op on RADV RDNA3 -- revisit if the cm1 gate lands), #28611 (RDNA3 L-tile
+# warp micro-dimension, +62 % pp on gfx1151: gated to UMA/iGPU on purpose and
+# does not merge; the underlying WM 64 -> 32 idea is untested on discrete
+# RDNA3), #27332 (MUL_MAT_VEC_ID density gate: batch>8 MoE decode, pp neutral,
+# and --parallel 2 + MTP keeps us at batch<=8), #28507 (FA shared-memory staging on the RDNA scalar
 # path: neutral on a 7900 XTX at kernel and server level, 2026-09-06), #25483 (MoE coopmat skip, +0.3%), #26284 + #26301
 # (HIP MMQ tuning / mmvdq: +2% pp, decode same, and #26284 carries RDNA4
 # changes its maintainer wants dropped), #22970 (stale, conflicts with master).
 # patches/*.patch (local rebased patches) apply after the merges to both
 # backends; the directory is EMPTY since 2026-09-06 (see patches/README.md).
 # Retire PRs from the list as they merge (the build says so).
-ARG LLAMA_PATCHES="28457 28243 28265 28213 28330 27210 28333 25592 28489"
+ARG LLAMA_PATCHES="27952 28243 28265 28213 28699 27210 28333 25592"
 
 # Cache key only (see LLAMA_SWAP_PATCHES_HEADS).
 ARG LLAMA_PATCHES_HEADS=""
@@ -285,6 +318,20 @@ ARG LLAMA_PATCHES_HEADS=""
 # built in BOTH published tags (nothing here needs the ROCm runtime). The fork
 # tracks upstream by merging master periodically, so it lags a few weeks; keep
 # `llama-server` the default engine and use this one per config entry.
+#
+# THIS STAGE APPLIES NO PRs, and it cannot: LLAMA_PATCHES is merged into the
+# upstream tree only. Measured 2026-09-10 -- the fork's master last merged
+# upstream at 0190529e (2026-08-30), and merging current master into it gives
+# 11 conflicts (ggml-vulkan.cpp, vulkan-shaders-gen.cpp, llama-kv-cache.cpp,
+# llama-memory-hybrid-idx.*, qwen4exp.cpp, dflash.cpp, convert_hf_to_gguf.py,
+# test-backend-ops.cpp, tools/ui/CMakeLists.txt). Merging a single PR head is
+# no better: the head carries master with it, so it hits the same conflicts.
+# Consequence to keep in mind when reading benchmark rows: the entries on
+# `llama-server-fpx` (i.e. qwen38) get NONE of the Vulkan prefill work in
+# LLAMA_PATCHES or in recent master -- #27952, #28457 and #28422 all miss them.
+# The fork's own engine work is still ahead of stock on this card (+15.2 % on a
+# 32k prompt, 2026-09-10), so the answer is to watch the fork for its next
+# upstream merge, not to hand-rebase it here.
 ARG WITH_FPX=true
 ARG FPX_REPO=https://github.com/LaurentZuijdwijk/llama.cpp.git
 ARG FPX_BRANCH=master
