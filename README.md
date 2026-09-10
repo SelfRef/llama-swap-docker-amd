@@ -241,6 +241,22 @@ docker run --rm ghcr.io/selfref/llama-swap-docker-amd:latest -version
 
 ## Benchmarking
 
+`--ppl` is the odd mode out: it measures **quality, not speed**, so its rows do not belong in a
+speed log. It runs `llama-perplexity` over the wikitext-2 raw test split — fetched once from the
+same URL `llama.cpp`'s own `scripts/get-wikitext-2.sh` uses and cached next to the model hub, so
+the numbers are comparable with those quoted upstream (`--ppl-file` overrides, and is the fallback
+on a host that cannot reach the URL). The KV cache is deliberately left at f16 rather than taking
+the entry's `--cache-type-k/v`: quantised KV would fold a *serving* choice into a measurement of
+the *weights*.
+
+It is the cheap, sensitive screen for a quant or requant — minutes, and a continuous number,
+where a task benchmark needs hundreds of samples to resolve the same difference. It does not say
+what the drift *costs*: a measured +4.3 % PPL on one model landed entirely on maths and code and
+not at all on instruction following, which only a task benchmark could show. Use it to **reject**
+candidates cheaply, not to accept them. `--kld-base` adds KL-divergence against a reference model,
+which is closer to what a quant recipe is tuned against; note the base file is large (hundreds of
+MB even at a couple of chunks) and must be produced from the full-precision file.
+
 `benchmark` (in `/usr/local/bin`, source `scripts/benchmark`) measures the llama.cpp text entries of
 the mounted llama-swap `config.yaml` and prints one table: model, the parameters that matter
 (quant, context, KV types, speculative type / draft length, placement, batch sizes) and the numbers.
@@ -255,6 +271,8 @@ docker compose exec llama-swap benchmark --prompt prose,prefill --prefill-tokens
 docker compose exec llama-swap benchmark --kernel --std --unload qwen38      # llama-bench, community-comparable line
 docker compose exec llama-swap benchmark --standalone --variant rocm --unload qwen38   # this entry on the ROCm build
 docker compose exec llama-swap benchmark --standalone --variant engram --unload qwen38-fl  # ... on EngramHalo (:full)
+docker compose exec llama-swap benchmark --ppl --unload <model> <other-quant>   # perplexity over wikitext-2
+docker compose exec llama-swap benchmark --ppl --kld-base ref.dat --unload <model>   # KL-divergence vs a reference
 docker compose exec llama-swap benchmark --prompt vision --vision-answers qwen35-4b lfm25-vl   # vision: accuracy + speed
 docker compose exec llama-swap benchmark --list                  # parsed entries, no requests
 ```

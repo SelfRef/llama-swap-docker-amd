@@ -5,7 +5,7 @@ Run INSIDE the llama-swap container (baked to /usr/local/bin/benchmark):
 
     docker compose exec llama-swap benchmark [options] [model ...]
 
-Four modes, one table:
+Five modes, one table:
 
   SAMPLED (default)  Requests go through llama-swap's /v1/chat/completions, exactly
                      as production traffic does: the entry swap-loads with its real
@@ -30,6 +30,17 @@ Four modes, one table:
                      and host substituted), bench it like --greedy mode, kill it.
                      For binary A/Bs (Vulkan vs ROCm vs a patched build) without a
                      temporary config entry.
+  --ppl              llama-perplexity on the entry's GGUF over wikitext-2. The odd
+                     one out: it measures QUALITY, not speed, so its rows do not
+                     belong in a speed log. It is the cheap, sensitive screen for a
+                     quant or requant -- minutes, and a continuous number instead of
+                     a task score that needs hundreds of samples to resolve. It says
+                     how far a file drifted, NOT what that costs in practice: a
+                     measured +4.3% PPL landed entirely on maths/code and not at all
+                     on instruction following, which only a task benchmark could
+                     show. Use it to reject candidates, not to accept them.
+                     --kld-base adds KL-divergence against a reference model, which
+                     is the metric quant recipes are actually tuned against.
 
 Things the numbers have taught us (keep in mind when reading a row):
   * accept  -- speculative entries only: draft tokens accepted / drafted. The gain
@@ -101,6 +112,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 import zlib
 import urllib.error
 import urllib.request
@@ -131,6 +143,18 @@ STANDARD_BENCH = ["-fa", "1", "-ctk", "q8_0", "-ctv", "q4_0", "-b", "2048", "-ub
 FIT_MARGIN_MIB = 1024  # llama-server's --fit on default margin (1 GiB)
 VARIANTS = ("vulkan", "rocm", "engram", "fpx")
 SIDECAR_PREFIXES = ("mmproj-", "mtp-", "dflash-", "eagle3-", "dspark-")
+# --ppl corpus: the wikitext-2 raw TEST split, fetched exactly the way llama.cpp's
+# own scripts/get-wikitext-2.sh does, so a PPL printed here is comparable with the
+# numbers upstream and PR threads quote. Cached next to the model hub on first use;
+# --ppl-file overrides it (and is the fallback if this host cannot reach the URL).
+WIKITEXT_URL = "https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip"
+WIKITEXT_MEMBER = "wikitext-2-raw/wiki.test.raw"
+# -c 512 is the convention every quoted PPL uses. The KV cache is deliberately left
+# at its f16 default rather than taking the entry's --cache-type-k/v: quantised KV
+# would fold a SERVING choice into a measurement of the WEIGHTS, and the two
+# questions have different answers.
+PPL_CTX = 512
+PPL_CHUNKS = 150
 PROMPT_ALIASES = {"story": "prose", "code": "json"}
 
 
@@ -396,6 +420,37 @@ def resolve_gguf(e: Entry) -> str:
     if len(cands) > 1:
         warn(f"{e.key}: several GGUFs match '{tag}' ({', '.join(cands)}); using {pick}")
     return os.path.join(snap, pick)
+
+
+def corpus_path(opts: argparse.Namespace) -> str:
+    """wikitext-2 test split, cached beside the model hub; fetched once on demand."""
+    if opts.ppl_file:
+        if not os.path.isfile(opts.ppl_file):
+            raise UserError(f"--ppl-file {opts.ppl_file} does not exist")
+        return opts.ppl_file
+    d = os.path.join(os.path.dirname(hub_dir().rstrip("/")), "corpus")
+    path = os.path.join(d, os.path.basename(WIKITEXT_MEMBER))
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        return path
+    tmp = path + ".part"
+    try:
+        os.makedirs(d, exist_ok=True)
+        warn(f"fetching the wikitext-2 corpus once -> {path}")
+        with urllib.request.urlopen(WIKITEXT_URL, timeout=180) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f)
+        with zipfile.ZipFile(tmp) as z, z.open(WIKITEXT_MEMBER) as src, open(path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    except (urllib.error.URLError, OSError, KeyError, zipfile.BadZipFile) as ex:
+        for leftover in (tmp, path):
+            if os.path.exists(leftover) and not os.path.getsize(leftover):
+                os.remove(leftover)
+        raise UserError(f"could not fetch {WIKITEXT_URL} ({ex}) -- download "
+                        f"wikitext-2-raw-v1.zip by hand and pass --ppl-file "
+                        f"{os.path.join(d, 'wiki.test.raw')}") from ex
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return path
 
 
 # ── HTTP / llama-swap ────────────────────────────────────────────────────────
@@ -1153,6 +1208,7 @@ class Row:
     flags: list[str] = field(default_factory=list)
     error: str | None = None
     kernel: dict = field(default_factory=dict)   # kernel-mode columns
+    ppl: dict = field(default_factory=dict)      # --ppl columns
 
 
 def _num(v: float | None, prec: int = 1) -> str:
@@ -1169,10 +1225,12 @@ class TablePrinter:
     KERNEL = [("model", 14, "l"), ("variant", 8, "l"), ("params", 44, "l"), ("pp512", 14, "r"),
               ("tg128", 12, "r"), ("pp512@8k", 14, "r"), ("tg128@8k", 12, "r"), ("build", 16, "l"),
               ("notes", 0, "l")]
+    PPL = [("model", 14, "l"), ("variant", 7, "l"), ("file", 40, "l"), ("chunks", 6, "r"),
+           ("ppl", 18, "r"), ("kld", 11, "r"), ("same top p", 10, "r"), ("notes", 0, "l")]
 
-    def __init__(self, kernel: bool, enabled: bool = True):
-        self.cols = self.KERNEL if kernel else self.SERVER
-        self.kernel = kernel
+    def __init__(self, mode: str, enabled: bool = True):
+        self.cols = {"kernel": self.KERNEL, "ppl": self.PPL}.get(mode, self.SERVER)
+        self.mode = mode
         self.enabled = enabled
 
     def _line(self, cells: list[str]) -> str:
@@ -1195,10 +1253,14 @@ class TablePrinter:
             notes = f"FAILED: {r.error}"
         else:
             notes = " ".join([f"{k}={v}" for k, v in r.extra.items()] + r.flags)
-        if self.kernel:
+        if self.mode == "kernel":
             k = r.kernel
             cells = [r.model, k.get("variant", "-"), r.params, k.get("pp512", "-"), k.get("tg128", "-"),
                      k.get("pp512@8k", "-"), k.get("tg128@8k", "-"), k.get("build", "-"), notes]
+        elif self.mode == "ppl":
+            k = r.ppl
+            cells = [r.model, k.get("variant", "-"), k.get("file", "-"), k.get("chunks", "-"),
+                     k.get("ppl", "-"), k.get("kld", "-"), k.get("same_top_p", "-"), notes]
         else:
             cells = [r.model, r.preset, r.params, _num(r.pp), _num(r.tg),
                      "-" if r.tok is None else str(r.tok), r.accept,
@@ -1207,8 +1269,22 @@ class TablePrinter:
         print(self._line(cells), flush=True)
 
 
-def print_md(rows: list[Row], kernel: bool, today: str) -> None:
-    if kernel:
+def print_md(rows: list[Row], mode: str, today: str) -> None:
+    if mode == "ppl":
+        print("| Date | Model / entry | Config under test | Result | Why / notes |")
+        print("|---|---|---|---|---|")
+        for r in rows:
+            if r.error:
+                print(f"| {today} | `{r.model}` | ppl | FAILED: {r.error} | |")
+                continue
+            k = r.ppl
+            res = f"PPL **{k.get('ppl', '-')}**"
+            if k.get("kld"):
+                res += f", mean KLD **{k['kld']}**, same top p {k.get('same_top_p', '-')}"
+            print(f"| {today} | `{r.model}` | llama-perplexity {k.get('variant', '')} "
+                  f"`{k.get('cmd', '')}` | {res} | {k.get('file', '')} {' '.join(r.flags)} |")
+        return
+    if mode == "kernel":
         print("| Date | Model / entry | Config under test | Result | Why / notes |")
         print("|---|---|---|---|---|")
         for r in rows:
@@ -1527,6 +1603,118 @@ def bench_kernel(entry: Entry, opts: argparse.Namespace, variant: str, swap: Swa
     return row
 
 
+# ── perplexity runner ────────────────────────────────────────────────────────
+def ppl_binary(variant: str | None) -> tuple[str, str]:
+    """Pick the llama-perplexity build. Default order prefers `fpx` because it reads
+    EVERY quant type in this image (the ROCmFPx types no other build understands),
+    and because using ONE binary for every file is what makes a set of PPL rows
+    comparable at all -- a PPL from build A and a PPL from build B are not."""
+    order = (variant,) if variant else ("fpx", "vulkan", "rocm", "engram")
+    for v in order:
+        b = "llama-perplexity" + ("" if v == "vulkan" else f"-{v}")
+        if shutil.which(b):
+            return b, v
+    have = sorted({os.path.basename(p) for d in os.environ["PATH"].split(":")
+                   for p in glob.glob(os.path.join(d, "llama-perplexity*"))})
+    raise UserError(f"no llama-perplexity binary for variant={variant or 'any'} "
+                    f"(have: {', '.join(have) or 'none'})")
+
+
+def ppl_argv(entry: Entry, gguf: str, corpus: str, opts: argparse.Namespace, binary: str) -> list[str]:
+    argv = [binary, "-m", gguf, "-f", corpus,
+            "-c", str(opts.ppl_ctx), "--chunks", str(opts.ppl_chunks),
+            "-fa", "on", "-b", "2048",
+            # Placement only: an entry pinned to the CPU is measured on the CPU,
+            # everything else goes fully on the GPU. No KV-type or batch flags from
+            # the entry -- see PPL_CTX for why.
+            "-ngl", "0" if entry.ngl == "0" else "99"]
+    if entry.threads:
+        argv += ["-t", str(entry.threads)]
+    if opts.kld_base:
+        argv += ["--kl-divergence-base", opts.kld_base]
+        if os.path.exists(opts.kld_base):
+            argv += ["--kl-divergence"]
+    if opts.ppl_args:
+        argv += shlex.split(opts.ppl_args)
+    return argv
+
+
+def parse_ppl(text: str) -> dict:
+    out: dict = {}
+    m = re.search(r"Final estimate:\s*PPL\s*=\s*([\d.]+)\s*\+/-\s*([\d.]+)", text)
+    if m:
+        out["ppl"] = f"{float(m.group(1)):.4f}±{float(m.group(2)):.4f}"
+        out["ppl_value"], out["ppl_stderr"] = float(m.group(1)), float(m.group(2))
+    m = re.search(r"Mean\s+KLD\s*:\s*([\d.eE+-]+)", text)
+    if m:
+        out["kld"] = m.group(1)
+    # "Same top p: 100.000 ± 0.000 %" -- do NOT anchor on a '%' right after the
+    # number, the mean is followed by its own ± stderr.
+    m = re.search(r"Same\s+top\s+p\s*:\s*([\d.]+)", text)
+    if m:
+        out["same_top_p"] = m.group(1) + "%"
+    m = re.search(r"RMS\s+.p\s*:\s*([\d.]+)", text)
+    if m:
+        out["rms_dp"] = m.group(1) + "%"
+    m = re.search(r"\bbuild\s*:\s*(\d+)\s*\(([0-9a-f]{4,})\)", text)
+    if m:
+        out["build"] = f"{m.group(1)} {m.group(2)}"
+    return out
+
+
+def bench_ppl(entry: Entry, opts: argparse.Namespace, variant: str | None, swap: Swap | None,
+              guard: Guard, corpus: str) -> Row:
+    row = Row(entry.key, "ppl", entry.params())
+    try:
+        binary, used = ppl_binary(variant)
+        gguf = resolve_gguf(entry)
+    except UserError as ex:
+        row.error = str(ex)
+        return row
+    row.ppl["variant"] = used
+    row.ppl["file"] = os.path.basename(gguf)
+    row.ppl["chunks"] = str(opts.ppl_chunks)
+    saving = bool(opts.kld_base) and not os.path.exists(opts.kld_base)
+    if saving:
+        warn(f"{entry.key}: --kld-base {opts.kld_base} does not exist -> SAVING this model's "
+             f"logits as the reference. Do this with the full-precision model, not a quant, "
+             f"and expect a large file.")
+    argv = ppl_argv(entry, gguf, corpus, opts, binary)
+    row.ppl["cmd"] = " ".join(shlex.quote(a) for a in argv[1:])
+    print(f"+ {' '.join(shlex.quote(a) for a in argv)}", file=sys.stderr, flush=True)
+    try:
+        # stderr is merged in: llama-perplexity prints the running estimate and the
+        # final line there, and it is the only progress the user sees on a long run.
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=opts.timeout * 8, check=False)
+    except subprocess.TimeoutExpired:
+        row.error = "llama-perplexity timed out"
+        return row
+    text = proc.stdout.decode(errors="replace")
+    sys.stderr.write(text[-2000:] if len(text) > 2000 else text)
+    sys.stderr.flush()
+    if proc.returncode != 0:
+        row.error = f"llama-perplexity exit {proc.returncode}"
+        return row
+    row.ppl.update(parse_ppl(text))
+    if saving and os.path.exists(opts.kld_base):
+        row.ppl["kld_base"] = fmt_gib(os.path.getsize(opts.kld_base) // (1024 * 1024))
+        row.flags.append("KLD-BASE-SAVED")
+    elif not row.ppl.get("ppl") and not row.ppl.get("kld"):
+        row.error = "llama-perplexity printed no final estimate"
+        return row
+    ev = guard.take()
+    if ev:
+        row.flags.append(f"EVICTED:{len(ev)}")
+    elif swap:
+        try:
+            if swap.running():
+                row.flags.append("CONTAMINATED")
+        except UserError:
+            pass
+    return row
+
+
 # ── standalone runner ────────────────────────────────────────────────────────
 def free_port() -> int:
     with socket.socket() as s:
@@ -1591,7 +1779,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="benchmark", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Benchmark llama-swap text entries (through llama-swap, production sampling by default), "
-                    "their GGUFs (llama-bench) or a standalone llama-server variant.",
+                    "their GGUFs (llama-bench / llama-perplexity) or a standalone llama-server variant.",
         epilog="presets:\n" + "\n".join(f"  {n:<12} {p.note}" for n, p in PRESETS.items())
                + "\ngroups:\n" + "\n".join(f"  {n:<12} {', '.join(v)}" for n, v in PRESET_GROUPS.items())
                + "\n\nexamples:\n  benchmark qwen38                      # all text presets, via llama-swap (production sampling)\n"
@@ -1601,6 +1789,8 @@ def build_parser() -> argparse.ArgumentParser:
                  "  benchmark --prompt vision --vision-answers qwen35-4b qwen35-2b lfm25-vl\n"
                  "  benchmark --kernel --std --unload qwen38\n"
                  "  benchmark --standalone --variant rocm --unload qwen38\n"
+                 "  benchmark --ppl --unload <model> <other-quant>   # quality screen for a quant A/B\n"
+                 "  benchmark --ppl --kld-base ref.dat --unload <model>   # KL-divergence vs a saved reference\n"
                  "  benchmark --list")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--kernel", action="store_true", help="llama-bench on the entry's GGUF (hardware/build number)")
@@ -1610,6 +1800,9 @@ def build_parser() -> argparse.ArgumentParser:
                            "filters and aliases bypassed)")
     mode.add_argument("--sampled", action="store_true",
                       help="via llama-swap /v1/chat/completions with the entry's filters (production sampling) -- the default")
+    mode.add_argument("--ppl", action="store_true",
+                      help="llama-perplexity on the entry's GGUF over wikitext-2 (QUALITY, not speed: "
+                           "a cheap screen for a quant/requant -- these rows do not belong in a speed log)")
     mode.add_argument("--list", action="store_true", help="list parsed llama-server entries, no requests")
     p.add_argument("--variant", choices=VARIANTS, help="llama.cpp build to use (--kernel/--standalone); default = the entry's binary")
     p.add_argument("--prompt", default="text",
@@ -1634,6 +1827,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--depth", help="--kernel: -d list (default 0,8192; 0 for CPU entries)")
     p.add_argument("--reps", type=int, default=5, help="--kernel: llama-bench -r")
     p.add_argument("--bench-args", help="--kernel: extra llama-bench args, verbatim")
+    p.add_argument("--ppl-file", metavar="FILE",
+                   help="--ppl: corpus to score (default: wikitext-2 test, fetched once and cached "
+                        "beside the model hub)")
+    p.add_argument("--ppl-chunks", type=int, default=PPL_CHUNKS, help="--ppl: --chunks (default %(default)s)")
+    p.add_argument("--ppl-ctx", type=int, default=PPL_CTX, help="--ppl: -c (default %(default)s)")
+    p.add_argument("--ppl-args", help="--ppl: extra llama-perplexity args, verbatim")
+    p.add_argument("--kld-base", metavar="FILE",
+                   help="--ppl: KL-divergence against a reference. If FILE is missing it is CREATED "
+                        "from the model being run (do that with the full-precision file; the result is "
+                        "large); if it exists, every model is scored against it. KLD answers 'how far "
+                        "did this file drift from the reference', which is what a quant recipe is "
+                        "actually tuned against -- PPL only answers 'how surprised is it by wikitext'")
     p.add_argument("models", nargs="*", help="entry keys (default: every listed text entry)")
     return p
 
@@ -1656,10 +1861,13 @@ def cmd_list(cfg: Config) -> None:
 
 def main() -> int:
     opts = build_parser().parse_args()
-    if opts.variant and not (opts.kernel or opts.standalone):
-        raise UserError("--variant only applies to --kernel / --standalone")
-    # llama-swap route modes: sampled (default) vs greedy; kernel/standalone bypass llama-swap
-    sampled = not (opts.greedy or opts.kernel or opts.standalone)
+    if opts.variant and not (opts.kernel or opts.standalone or opts.ppl):
+        raise UserError("--variant only applies to --kernel / --standalone / --ppl")
+    # Modes that run a llama.cpp binary directly instead of going through llama-swap.
+    # They need the GPU to themselves, so they share the resident-model preflight.
+    offline = opts.kernel or opts.standalone or opts.ppl
+    # llama-swap route modes: sampled (default) vs greedy; the offline modes bypass llama-swap
+    sampled = not (opts.greedy or offline)
     if opts.vision_dump:
         os.makedirs(opts.vision_dump, exist_ok=True)
         for name, build in IMAGES.items():
@@ -1681,7 +1889,7 @@ def main() -> int:
     try:
         resident = swap.running()
     except UserError as ex:
-        if opts.kernel or opts.standalone:
+        if offline:
             warn(f"{ex}; continuing without llama-swap coordination")
             swap, resident = None, []
         else:
@@ -1691,10 +1899,10 @@ def main() -> int:
         warn(f"unloading {', '.join(resident)}")
         swap.unload()
         resident = []
-    if (opts.kernel or opts.standalone) and resident:
+    if offline and resident:
         raise UserError(f"models resident in llama-swap ({', '.join(resident)}); pass --unload "
                         f"or wait -- the GPU must be free for this mode")
-    if resident and not (opts.kernel or opts.standalone):
+    if resident and not offline:
         warn(f"already resident: {', '.join(resident)} (gtt baseline includes them)")
     guard = Guard(swap, enabled=not opts.no_guard)
     baseline_gtt, uma = gtt_mib(), is_uma()
@@ -1711,17 +1919,21 @@ def main() -> int:
     if not targets:
         raise UserError("no text entries found")
 
+    corpus = corpus_path(opts) if opts.ppl else None
     today = _dt.date.today().isoformat()
     ver = versions()
-    mode = "kernel" if opts.kernel else "standalone" if opts.standalone else "sampled" if sampled else "greedy"
+    mode = ("kernel" if opts.kernel else "ppl" if opts.ppl else "standalone" if opts.standalone
+            else "sampled" if sampled else "greedy")
     meta = {"date": today, "mode": mode, "presets": [p.name for p in presets], "repeat": opts.repeat,
             "n_predict": opts.n_predict, "prefill_tokens": opts.prefill_tokens,
             "llama_vulkan_commit": ver.get("llama_vulkan_commit", "?").split()[0],
             "llama_patches": ver.get("llama_patches", ""),
             "llama_swap": ver.get("llama-swap", "?"), "models": [t[0].key for t in targets]}
-    table = TablePrinter(kernel=opts.kernel, enabled=(opts.format == "table"))
+    table = TablePrinter(mode, enabled=(opts.format == "table"))
     if opts.format == "table":
-        print(f"benchmark {today} mode={mode} presets={','.join(meta['presets'])} repeat={opts.repeat} "
+        what = (f"corpus={os.path.basename(corpus or '-')} chunks={opts.ppl_chunks} ctx={opts.ppl_ctx}"
+                if opts.ppl else f"presets={','.join(meta['presets'])} repeat={opts.repeat}")
+        print(f"benchmark {today} mode={mode} {what} "
               f"llama.cpp={meta['llama_vulkan_commit'][:8]}"
               + (f" prs={meta['llama_patches'].replace(' ', ',')}" if meta['llama_patches'] else "")
               + (" SAMPLED -- production sampling, not comparable with --greedy rows" if sampled else "") + "\n", flush=True)
@@ -1731,9 +1943,14 @@ def main() -> int:
     guard.start()
     for entry, model in targets:
         variant = opts.variant or entry.variant
-        guard.allow(*([] if (opts.kernel or opts.standalone) else [entry.key]))
+        guard.allow(*([] if offline else [entry.key]))
         if opts.kernel:
             row = bench_kernel(entry, opts, variant, swap, guard)
+            rows.append(row)
+            table.row(row)
+            continue
+        if opts.ppl:
+            row = bench_ppl(entry, opts, opts.variant, swap, guard, corpus)
             rows.append(row)
             table.row(row)
             continue
@@ -1762,7 +1979,7 @@ def main() -> int:
     guard.stop()
 
     if opts.format == "md":
-        print_md(rows, opts.kernel, today)
+        print_md(rows, mode, today)
     elif opts.format == "json":
         print_json(rows, meta)
     failed = [r for r in rows if r.error]
