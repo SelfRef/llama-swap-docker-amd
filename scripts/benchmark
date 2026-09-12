@@ -3,18 +3,16 @@
 
 Run INSIDE the llama-swap container (baked to /usr/local/bin/benchmark):
 
-    docker compose exec llama-swap benchmark [options] [model ...]
+    docker compose exec llama-swap benchmark [options] <model> [model ...]
+    docker compose exec llama-swap benchmark [options] --all      # every listed text entry
+
+A model name is REQUIRED (entry key, alias, or :l/:m/:x tier -- see --list). The
+full sweep is every preset x every entry and swaps a ~20 GB model per vram entry,
+so it takes hours and has to be asked for with --all rather than fallen into.
 
 Five modes, one table:
 
-  SAMPLED (default)  Requests go through llama-swap's /v1/chat/completions, exactly
-                     as production traffic does: the entry swap-loads with its real
-                     flags (MTP, mmproj, --parallel, KV types ...) AND its filters
-                     apply (setParams sampling, :l/:m/:x reasoning aliases). This
-                     is the "what users get" number. Output is not deterministic,
-                     so the hash column is blank and rows are NOT comparable with
-                     --greedy rows.
-  --greedy           Through llama-swap's /upstream/<model>/ raw proxy, which
+  GREEDY (default)   Through llama-swap's /upstream/<model>/ raw proxy, which
                      swap-loads the same entry but skips the OpenAI-route filters
                      (setParams would overwrite temperature and break determinism).
                      Every measured request is GREEDY (temp 0, top_k 1, seed 42,
@@ -22,6 +20,20 @@ Five modes, one table:
                      sense, so the numbers are pure throughput and the content
                      hash is a determinism check for build/config A/Bs. Aliases
                      resolve to their parent entry (no filters on this route).
+                     The default since 2026-09-12, because nearly every row in a
+                     speed log is an A/B and those need determinism + the hash.
+                     CAVEAT: it OVERSTATES real-world decode, since draft
+                     acceptance falls at production temperature -- measured on
+                     qwen38-fast 2026-09-12: prose +26% (71.4 vs 56.7 t/s, accept
+                     44 vs 29%), tools +7%, json +2%. Never quote it as "what
+                     users get", and never mix the two in one comparison.
+  --sampled          Requests go through llama-swap's /v1/chat/completions, exactly
+                     as production traffic does: the entry swap-loads with its real
+                     flags (MTP, mmproj, --parallel, KV types ...) AND its filters
+                     apply (setParams sampling, :l/:m/:x reasoning aliases). This
+                     is the "what users get" number. Output is not deterministic,
+                     so the hash column is blank and rows are NOT comparable with
+                     greedy rows. Was the default from 2026-09-08 to 2026-09-12.
   --kernel           llama-bench[-<variant>] on the entry's GGUF with the entry's
                      KV/batch/placement flags (or --std for the fixed community-
                      comparable line). No speculative decoding, no mmproj: this is
@@ -85,10 +97,13 @@ Things the numbers have taught us (keep in mind when reading a row):
                incomparable. Rerun the sweep instead. `--vision-answers` prints
                what each model actually replied, which is the part worth reading.
 
-Vision presets are NOT part of the default `text` group (most entries have no image
-input); ask for them with --prompt vision (both), vision-ocr / vision-vqa, or all
-(text+vision). `fast` = prose, json, tools: the quick smoke test (no 32k prompts,
-no 1k-token generation) for "did this config/build change break or slow anything".
+--prompt defaults to `fast` (= prose, json, tools) since 2026-09-12: the quick
+smoke test, no 32k prompts and no 1k-token generation, for "did this config/build
+change break or slow anything". Ask for `text` (every text preset) when you want
+the full sweep -- that was the default before 2026-09-12, so older rows taken
+without an explicit --prompt are `text` rows.
+Vision presets are in neither group (most entries have no image input); ask for
+them with --prompt vision (both), vision-ocr / vision-vqa, or all (text+vision).
 An entry without "image" in capabilities.in skips them with a warning.
 """
 from __future__ import annotations
@@ -322,6 +337,12 @@ class Config:
         return [e for e in self.entries.values()
                 if os.path.basename(e.binary).startswith("llama-server")]
 
+    def _is_local(self, name: str) -> bool:
+        """True for an entry key OR any local alias / reasoning-tier id of one."""
+        if name in self.entries:
+            return True
+        return any(name in e.aliases or name in e.tier_ids for e in self.entries.values())
+
     def resolve(self, name: str, sampled: bool) -> tuple[Entry, str]:
         """-> (entry, model field to send). Aliases resolve to their parent."""
         if "/" in name:
@@ -329,7 +350,11 @@ class Config:
             if peer in self.peers:
                 raise UserError(f"{name}: served by remote peer '{peer}' -- run benchmark on that box")
         for peer, pd in self.peers.items():
-            if name in (pd.get("models") or []) and name not in self.entries:
+            # A LOCAL alias wins over a peer that happens to export the same bare
+            # name -- the check below used to compare against entry keys only, so
+            # a local alias (e.g. `qwen38` -> `qwen38-fast`) was reported as
+            # "only exists on peer" and never reached the alias lookup underneath.
+            if name in (pd.get("models") or []) and not self._is_local(name):
                 raise UserError(f"{name}: only exists on peer '{peer}' -- run benchmark on that box")
         if name in self.entries:
             e = self.entries[name]
@@ -1796,18 +1821,20 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--kernel", action="store_true", help="llama-bench on the entry's GGUF (hardware/build number)")
     mode.add_argument("--standalone", action="store_true", help="spawn llama-server-<variant> with the entry's cmd")
     mode.add_argument("--greedy", action="store_true",
-                      help="via llama-swap /upstream/<model>/ with a greedy body (deterministic, hash column filled; "
-                           "filters and aliases bypassed)")
+                      help="via llama-swap /upstream/<model>/ with a greedy body -- THE DEFAULT: "
+                           "deterministic, hash column filled, filters bypassed (aliases bench their parent)")
     mode.add_argument("--sampled", action="store_true",
-                      help="via llama-swap /v1/chat/completions with the entry's filters (production sampling) -- the default")
+                      help="via llama-swap /v1/chat/completions with the entry's filters (production sampling) "
+                           "-- what users actually get; slower than the greedy default where speculative decoding "
+                           "loses acceptance at temperature")
     mode.add_argument("--ppl", action="store_true",
                       help="llama-perplexity on the entry's GGUF over wikitext-2 (QUALITY, not speed: "
                            "a cheap screen for a quant/requant -- these rows do not belong in a speed log)")
     mode.add_argument("--list", action="store_true", help="list parsed llama-server entries, no requests")
     p.add_argument("--variant", choices=VARIANTS, help="llama.cpp build to use (--kernel/--standalone); default = the entry's binary")
-    p.add_argument("--prompt", default="text",
-                   help="comma-separated presets or a group: text (default), fast (prose,json,tools), "
-                        "vision, all (text+vision)")
+    p.add_argument("--prompt", default="fast",
+                   help="comma-separated presets or a group: fast (prose,json,tools -- the DEFAULT, "
+                        "a ~1 min smoke test), text (every text preset), vision, all (text+vision)")
     p.add_argument("--vision-answers", action="store_true",
                    help="print every vision case's answer and score to stderr")
     p.add_argument("--vision-dump", metavar="DIR",
@@ -1839,7 +1866,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "large); if it exists, every model is scored against it. KLD answers 'how far "
                         "did this file drift from the reference', which is what a quant recipe is "
                         "actually tuned against -- PPL only answers 'how surprised is it by wikitext'")
-    p.add_argument("models", nargs="*", help="entry keys (default: every listed text entry)")
+    p.add_argument("--all", action="store_true",
+                   help="run EVERY listed text entry instead of named ones. Naming a model is "
+                        "otherwise required: the full sweep is presets x entries, swaps a ~20 GB "
+                        "model per vram entry and takes hours, so it must be asked for explicitly")
+    p.add_argument("models", nargs="*",
+                   help="entry keys or their aliases / :l:m:x tiers (--list shows both)")
     return p
 
 
@@ -1863,11 +1895,30 @@ def main() -> int:
     opts = build_parser().parse_args()
     if opts.variant and not (opts.kernel or opts.standalone or opts.ppl):
         raise UserError("--variant only applies to --kernel / --standalone / --ppl")
+    # A model name is mandatory (2026-09-12). The bare sweep is presets x every
+    # listed entry, and on a multi-GPU box the vram entries swap one at a time,
+    # so it is a full ~20 GB load each plus a 32k-prompt pass -- hours of work
+    # that used to start by typing `benchmark` with no arguments. `--all` is the
+    # explicit opt-in. --list/--vision-dump legitimately take no model.
+    if not (opts.list or opts.vision_dump):
+        if opts.all and opts.models:
+            raise UserError("--all runs every listed entry; do not also name models")
+        if not opts.all and not opts.models:
+            raise UserError("name at least one entry, or pass --all for every listed entry "
+                            "(that is every preset x every entry and takes hours); "
+                            "`--list` shows the entry keys")
     # Modes that run a llama.cpp binary directly instead of going through llama-swap.
     # They need the GPU to themselves, so they share the resident-model preflight.
     offline = opts.kernel or opts.standalone or opts.ppl
-    # llama-swap route modes: sampled (default) vs greedy; the offline modes bypass llama-swap
-    sampled = not (opts.greedy or offline)
+    # llama-swap route modes: GREEDY is the default since 2026-09-12 (it was
+    # sampled from 09-08); --sampled is the opt-out. Rationale: nearly every row
+    # in the speed log is an A/B ("did this config/quant/build help?"), which
+    # needs determinism and the output hash, and greedy's lower variance makes a
+    # single run trustworthy. The cost is that greedy OVERSTATES real-world
+    # decode, because draft acceptance falls at production temperature -- measured
+    # on qwen38-fast 2026-09-12: prose +26 % (71.4 vs 56.7 t/s, accept 44 vs 29 %),
+    # tools +7 %, json +2 %. Quote --sampled for "what users get".
+    sampled = opts.sampled and not offline
     if opts.vision_dump:
         os.makedirs(opts.vision_dump, exist_ok=True)
         for name, build in IMAGES.items():
@@ -1914,7 +1965,7 @@ def main() -> int:
     if opts.models:
         for name in opts.models:
             targets.append(cfg.resolve(name, sampled))
-    else:
+    else:  # --all (guaranteed by the check in main()'s preamble)
         targets = [(e, e.key) for e in cfg.text_entries()]
     if not targets:
         raise UserError("no text entries found")
@@ -1936,7 +1987,9 @@ def main() -> int:
         print(f"benchmark {today} mode={mode} {what} "
               f"llama.cpp={meta['llama_vulkan_commit'][:8]}"
               + (f" prs={meta['llama_patches'].replace(' ', ',')}" if meta['llama_patches'] else "")
-              + (" SAMPLED -- production sampling, not comparable with --greedy rows" if sampled else "") + "\n", flush=True)
+              + (" SAMPLED -- production sampling, not comparable with --greedy rows" if sampled else "")
+              + (" GREEDY -- deterministic; OVERSTATES decode vs production sampling (accept falls at temperature)"
+                 if mode == "greedy" else "") + "\n", flush=True)
         table.header()
 
     rows: list[Row] = []

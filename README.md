@@ -262,11 +262,11 @@ the mounted llama-swap `config.yaml` and prints one table: model, the parameters
 (quant, context, KV types, speculative type / draft length, placement, batch sizes) and the numbers.
 
 ```sh
-docker compose exec llama-swap benchmark                         # every listed text entry, all presets
-docker compose exec llama-swap benchmark qwen38 qwen38-hh        # via llama-swap, production sampling + filters
+docker compose exec llama-swap benchmark qwen38 qwen38-hh        # greedy (default), deterministic + hash
+docker compose exec llama-swap benchmark --sampled qwen38         # production sampling + filters: what users get
+docker compose exec llama-swap benchmark --all                   # every listed text entry (hours -- see below)
 docker compose exec llama-swap benchmark qwen38:l                # a reasoning alias, with its filters
-docker compose exec llama-swap benchmark --greedy qwen38 qwen38-hh   # deterministic greedy body via /upstream (hash-comparable)
-docker compose exec llama-swap benchmark --prompt fast qwen38     # quick smoke test: prose, json, tools
+docker compose exec llama-swap benchmark --prompt text qwen38     # all text presets (fast is the default)
 docker compose exec llama-swap benchmark --prompt prose,prefill --prefill-tokens 65536 qwen38-fl
 docker compose exec llama-swap benchmark --kernel --std --unload qwen38      # llama-bench, community-comparable line
 docker compose exec llama-swap benchmark --standalone --variant rocm --unload qwen38   # this entry on the ROCm build
@@ -279,12 +279,14 @@ docker compose exec llama-swap benchmark --list                  # parsed entrie
 
 | Mode | What runs | What it tells you |
 |---|---|---|
-| sampled (default) | llama-swap's `/v1/chat/completions` with the entry's filters (production sampling, aliases like `:l` allowed) | what users get; hash blank, not comparable with greedy |
-| `--greedy` | greedy requests through `/upstream/<model>/` (real entry flags: MTP, mmproj, `--parallel`, KV types; llama-swap filters bypassed, aliases resolve to the parent) | deterministic throughput + output hash for build/config A/Bs |
+| greedy (**default** since 2026-09-12) | greedy requests through `/upstream/<model>/` (real entry flags: MTP, mmproj, `--parallel`, KV types; llama-swap filters bypassed, aliases resolve to the parent) | deterministic throughput + output hash for build/config A/Bs. **Overstates real-world decode** — draft acceptance falls at production temperature (qwen38-fast, 2026-09-12: prose +26 %, tools +7 %, json +2 %) |
+| `--sampled` | llama-swap's `/v1/chat/completions` with the entry's filters (production sampling, aliases like `:l` allowed) | what users actually get; hash blank, not comparable with greedy rows |
 | `--kernel` | `llama-bench[-<variant>]` on the entry's cached GGUF with the entry's KV/batch/placement flags, or `--std` for `-fa 1 -ctk q8_0 -ctv q4_0 -b 2048 -ub 512 -p 512 -n 128 -d 0,8192` | hardware / driver / build (no speculative decoding, no mmproj) |
 | `--standalone --variant V` | spawns `llama-server-<V>` with the entry's exact cmd (host/port substituted), benches it like `--greedy`, kills it | binary A/Bs without a temporary config entry |
 
-Variants are `vulkan` (plain `llama-server`), `rocm`, `engram` and `fpx`. Presets (`--prompt`, default group `text`): `prose` (free text, speculative worst case), `json` (structured
+**A model name is required** since 2026-09-12 — pass `--all` for every listed text entry. The full sweep is every preset x every entry, and on a multi-GPU box the `vram` entries swap one at a time, so it is a ~20 GB load per entry plus a 32k-prompt pass (`prefill`, `depth`): hours of work that used to start by typing `benchmark` with no arguments. Model names may be entry keys or their aliases / `:l:m:x` tiers.
+
+Variants are `vulkan` (plain `llama-server`), `rocm`, `engram` and `fpx`. Presets (`--prompt`, **default group `fast`** = prose, json, tools, the ~1 min smoke test; `text` = all of them): `prose` (free text, speculative worst case), `json` (structured
 output, best case), `refactor` (copy-heavy code edit, ~2k-token module), `agent` (tool-calling
 transcript, 6 tools, ~2.5k prompt tokens; column `call`), `tools` (single tool call, natural stop;
 `call`/`finish`), `reasoning` (`enable_thinking` on; `think`), `prefill` (pure big-context prefill,
