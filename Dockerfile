@@ -206,6 +206,7 @@ ARG LLAMA_COMMIT="master"
 #   Models
 #   #28243 Qwen3.8-Flash-Next MTP draft head + draft-only sidecar loading
 #          (unsloth's upstream PR; supersedes the local #27836/#28097 rebases)
+#          -- MOVED to patches/28243-rebased.patch on 2026-09-15, see below
 #   #28265 keep Qwen3.5-family delta-net out-proj 2D (Strix Halo: +6-9% TG at
 #          batch 4-8 = our --parallel 2 + MTP verify batches)
 #   #28213 gather-based sparse attention for qwen4exp QSA decode (+50% tg
@@ -272,10 +273,115 @@ ARG LLAMA_COMMIT="master"
 # path: neutral on a 7900 XTX at kernel and server level, 2026-09-06), #25483 (MoE coopmat skip, +0.3%), #26284 + #26301
 # (HIP MMQ tuning / mmvdq: +2% pp, decode same, and #26284 carries RDNA4
 # changes its maintainer wants dropped), #22970 (stale, conflicts with master).
+# ADDED 2026-09-15 (survey of new/updated upstream PRs; all six test-merged on
+# top of master 38a5b42d + the seven PRs above + patches/28243-rebased.patch,
+# all clean). Nothing here is measured on this box yet -- this is the
+# "full experimental" set, and every entry is a candidate for removal if the
+# post-build benchmark says so:
+#   #25666 Vulkan: do NOT enable MMVQ for speculative-decode steps on AMD. A
+#          spec step evaluates n = 1 + n_draft, which trips the "n > 1 means a
+#          batch" early-out in ggml_vk_should_use_mmvq() and takes the MMVQ
+#          path, where the Q8_1 activation quantization neither amortizes at
+#          that n NOR keeps the logits identical -- so it lowers draft
+#          ACCEPTANCE as well as speed. gfx1151, 35B-A3B MoE + MTP @33k: TG
+#          75.2 -> 84.9 t/s (+12.9 %), acceptance 72-75 % -> 83-85 %, prefill
+#          unchanged. Applies to the stock-Vulkan MTP entries (qwen38-bart,
+#          -hau, -hui); NOT to qwen38-fast (fpx fork takes no PRs) and NOT to
+#          qwen38-flash (HIP). Only gfx1151 data exists upstream -- the author
+#          is asking for discrete-GPU numbers, which this box can produce.
+#   #28927 context: drop the sched_need_reserve from set_causal_attn(). The
+#          causal flag only changes KQ mask CONTENTS, not graph topology, and
+#          allow_reuse() already compares it. mtmd toggles it twice per image
+#          chunk and each toggle forced a full scheduler reserve (new sched +
+#          worst-case graph + compute buffers) -- hundreds of ms at high n_ctx,
+#          two per video frame. We serve vision at ctx 32768. One line.
+#          (#28751 is the same idea and #28872 a broader variant -- one only.)
+#   #28956 Vulkan correctness: a mul_mat reading a slice of a larger cache took
+#          the head stride from the visible row count instead of the tensor, so
+#          every head but the first read the wrong data (repairs the Qwen3 AR
+#          --no-fa path). Does not obviously explain any of the three RADV
+#          qwen35-* faults that moved those entries to ROCm on 09-15, but it is
+#          the same neighbourhood (cache views) -- keep it in the tree for that
+#          re-test.
+#   #28876 server: allow RANK pooling to split prefill across physical batches
+#          for causal-decoder rerankers (Qwen3). Today a rerank document larger
+#          than one physical batch simply does not work, which is why the
+#          qwen3-rerank entry carries --ubatch-size 8192; with this, that
+#          workaround can go and documents may exceed 8192.
+#   #28901 qwen4exp: fused hyper-connection ops (gated hc_pre, null-comb
+#          hc_post). MATTERS FOR HIP, NOT VULKAN: it adds ggml-cuda/dsv4-hc.cu
+#          with both variants templated and leaves the CUDA supports_op alone,
+#          while its Vulkan hunk REJECTS both new variants (gate param != 0,
+#          src[3] == nullptr), so the auto_fhc probe turns the fusion off on
+#          Vulkan and those entries keep the unfused path. qwen38-flash runs
+#          llama-server-rocm, so it is the one that can win here. Upstream
+#          numbers are CPU-only (pp2048 +14 % on a DGX Spark). Keeps the
+#          build_hc_mix()/build_hc_combine() signatures and gates the fused
+#          path on il >= 0, so the MTP head call (il = -1) from the #28243
+#          patch is untouched. NOTE this is the same author's follow-up to the
+#          master gamma reshape that broke #28243 -- expect more churn here.
+#   #28943 HIP: skip fully masked KV tiles in the AMD WMMA flash-attention
+#          path (#28495). Improves HIP PREFILL when server slots share a
+#          unified KV cache, which since 2026-09-15 is qwen38-flash
+#          (--parallel 2) plus all three qwen35-* entries (--parallel 4) that
+#          moved to llama-server-rocm. Brand new, no reviews, and it changes FA
+#          math -- verify OUTPUT, not just t/s, before trusting it.
+# LOCAL VERIFICATION 2026-09-15 (both stages built here, not on CI:
+# `docker build --target llama-vulkan .` and `--target llama-rocm
+# --build-arg AMDGPU_TARGETS="gfx1100;gfx1101"` -- 176 s and ~7 min on this
+# box, vs hours of runner time, so test the merge set this way BEFORE pushing):
+#   both stages compile clean, including #28901's new ggml-cuda/dsv4-hc.cu
+#   under HIP and #28943's fattn-mma-f16.cuh changes.
+#   Binaries run from the :full runtime image (stage images have no Mesa ICD):
+#   - Vulkan: a greedy completion is BYTE-IDENTICAL to the shipped build.
+#   - #28876 CONFIRMED FIXED: a 1608-token rerank document at --ubatch-size 512
+#     is refused by the shipped build ("input is too large to process") and
+#     scored by this one. The qwen3-rerank entry's --ubatch-size 8192 can go.
+#   - HIP qwen4exp (qwen38-flash flags, ctx 8192): loads, output byte-identical
+#     to the shipped build, DRAFT ACCEPTANCE 0.714 / mean len 3.14 -- so the
+#     rebased #28243 patch works end to end (draft head + Q8_0 sidecar).
+#   - #28943's path (4 slots on one unified KV, FA on, HIP): coherent output.
+#   - #28901 is ACTIVE ON HIP ONLY, confirmed in the merged source: the CUDA/HIP
+#     supports_op takes DSV4_HC_PRE with the gate param and DSV4_HC_POST with a
+#     null comb, which is exactly what Vulkan rejects.
+#   NOT measured: every speed number. Decode t/s on a GPU shared with the live
+#   stack scattered +-20 % run to run (qwen35-2b 50-72 t/s on BOTH builds), so
+#   #25666 and #28901 need `benchmark` on a quiet box, not a smoke test.
+# Looked at and deliberately NOT added on 2026-09-15:
+#   #28092 (--cache-disk) refreshed 09-14 and merges into master again, but
+#          STILL conflicts with #25592 in tools/server/server-context.cpp on
+#          our tree -- the 09-10 trade is unchanged, #25592 is the bigger win.
+#   #28528 (stream-k MUL_MAT) touched 09-15 but is still enabled for coopmat2
+#          only: the cm1 shaders exist, the author declines to tune the cm1
+#          heuristic on NVIDIA hardware. Still a no-op on RADV -- and an
+#          opening for someone with an XTX to tune it.
+#   #28415 / #28440 (IQ4_XS MMQ/MMV) rebased + "optimize" on 09-15 with
+#          NOTHING addressing the RDNA3 degenerate output the 09-09 bisect
+#          found here (never reported upstream -- worth filing).
+#   #28849 (auto-fit tries model ctx x parallel slots under unified KV) -- not
+#          a win, a behaviour change: every entry here runs --fit on with
+#          --parallel 2/4 against huge native contexts, so it can start picking
+#          much larger contexts and reshuffling experts. Watch it land.
+#   #25483 (skip unneeded MoE work in the coopmat1 path) measured +0.3 % here
+#          on 09-06; not worth the rebase burden.
+# Revised 2026-09-15 against master 38a5b42d, after the CI build failed:
+#   #28243 (qwen4exp MTP) DROPPED FROM THE LIST and carried as
+#          patches/28243-rebased.patch instead. Master moved the grouped-norm
+#          gammas (hc_*_norm, ple_norm_*) from a flat [hc_dim] tensor to
+#          [n_embd, hc] + TENSOR_ALLOW_RESHAPE so build_hc_mix scales the
+#          stream without a graph reshape, while the PR rewrote the same lines
+#          to load them with MTP-aware flags -- three conflicting hunks in
+#          src/models/qwen4exp.cpp, nothing else in the eight-PR set. The
+#          rebased patch keeps both sides (master's shapes, the PR's flags) and
+#          gives the PR's own nextn.hc_head_norm the same [n_embd, hc] shape,
+#          since it feeds the same build_hc_mix. Drop the patch and put #28243
+#          back in the list the moment the author rebases it -- this is the MTP
+#          draft head qwen38-flash runs on, so it cannot simply be left out.
 # patches/*.patch (local rebased patches) apply after the merges to both
-# backends; the directory is EMPTY since 2026-09-06 (see patches/README.md).
+# backends -- so a patch has to be generated against the tree with ALL the
+# other merges in it, not just against master (see patches/README.md).
 # Retire PRs from the list as they merge (the build says so).
-ARG LLAMA_PATCHES="27952 28243 28265 28213 28699 27210 28333 25592"
+ARG LLAMA_PATCHES="27952 28265 28213 28699 27210 28333 25592 25666 28927 28956 28876 28901 28943"
 
 # Cache key only (see LLAMA_SWAP_PATCHES_HEADS).
 ARG LLAMA_PATCHES_HEADS=""
