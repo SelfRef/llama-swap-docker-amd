@@ -12,7 +12,18 @@ so it takes hours and has to be asked for with --all rather than fallen into.
 
 Five modes, one table:
 
-  GREEDY (default)   Through llama-swap's /upstream/<model>/ raw proxy, which
+  SAMPLED (default)  Requests go through llama-swap's /v1/chat/completions, exactly
+                     as production traffic does: the entry swap-loads with its real
+                     flags (MTP, mmproj, --parallel, KV types ...) AND its filters
+                     apply (setParams sampling, :l/:m/:x reasoning aliases), so an
+                     alias is benched as itself. This is the "what users get"
+                     number, and the default AGAIN since 2026-09-15 (it already was
+                     from 2026-09-08 to 2026-09-12): a row that nobody can feel is
+                     not worth taking, and the util/latency work of 09-15 is about
+                     what the user waits for. Output is not deterministic, so the
+                     hash column is blank and single runs move more than a greedy
+                     one -- use --repeat 3 for a close A/B.
+  --greedy           Through llama-swap's /upstream/<model>/ raw proxy, which
                      swap-loads the same entry but skips the OpenAI-route filters
                      (setParams would overwrite temperature and break determinism).
                      Every measured request is GREEDY (temp 0, top_k 1, seed 42,
@@ -20,20 +31,14 @@ Five modes, one table:
                      sense, so the numbers are pure throughput and the content
                      hash is a determinism check for build/config A/Bs. Aliases
                      resolve to their parent entry (no filters on this route).
-                     The default since 2026-09-12, because nearly every row in a
-                     speed log is an A/B and those need determinism + the hash.
-                     CAVEAT: it OVERSTATES real-world decode, since draft
+                     Ask for it when the question is "did this build/quant/flag
+                     change anything", where determinism and the hash are the
+                     point. CAVEAT: it OVERSTATES real-world decode, since draft
                      acceptance falls at production temperature -- measured on
                      qwen38-fast 2026-09-12: prose +26% (71.4 vs 56.7 t/s, accept
                      44 vs 29%), tools +7%, json +2%. Never quote it as "what
                      users get", and never mix the two in one comparison.
-  --sampled          Requests go through llama-swap's /v1/chat/completions, exactly
-                     as production traffic does: the entry swap-loads with its real
-                     flags (MTP, mmproj, --parallel, KV types ...) AND its filters
-                     apply (setParams sampling, :l/:m/:x reasoning aliases). This
-                     is the "what users get" number. Output is not deterministic,
-                     so the hash column is blank and rows are NOT comparable with
-                     greedy rows. Was the default from 2026-09-08 to 2026-09-12.
+                     Was the default from 2026-09-12 to 2026-09-15.
   --kernel           llama-bench[-<variant>] on the entry's GGUF with the entry's
                      KV/batch/placement flags (or --std for the fixed community-
                      comparable line). No speculative decoding, no mmproj: this is
@@ -88,6 +93,25 @@ Things the numbers have taught us (keep in mind when reading a row):
     it Vulkan runs mmap OFF and pins every CPU-side tensor (77 GiB GTT seen).
   * Benchmark on an idle box; single runs are +-5%, the first run after an image
     switch can read ~10% low.
+  * backend -- own column, since 2026-09-15: which binary serves the entry and on
+               which device, `<variant>@<api><index>` -- vulkan/rocm/fpx/engram (the
+               llama-server-<suffix> the cmd names) @ vk0/vk1/hip0/cuda0 (the entry's
+               own `env:` pin), `cpu` for an -ngl 0 entry, and no @ when nothing is
+               pinned. Never omit it from a quoted row: this box has two cards and
+               three of the entries moved backend on 2026-09-15 alone (qwen35-2b
+               reads 139 t/s on rocm vs 8.7 on vulkan), so a t/s without a backend
+               is not a number anyone can reuse. --kernel, --standalone and --ppl
+               now also RUN with the entry's env, so the column is true in every
+               mode (before 2026-09-15 they inherited the container's device
+               visibility and could measure a pinned entry on the wrong card).
+  * t (s)   -- own column, since 2026-09-15: wall clock of the whole measured
+               request, end to end, client side (median over --repeat). It is the ONLY number that
+               matters for the `util` preset: that answer is ~20 tokens, so pp and
+               tg hide the fixed costs (chat-template render, the cold prefill of a
+               ~2k prompt, the llama-swap hop, the first-token latency) which are
+               exactly what a user waiting for a chat title feels. On fixed-length
+               presets it is redundant with tok/tg; on natural-stop ones (util,
+               tools) it is not, because the models differ in how much they say.
   * acc     -- vision presets only: how much the model got RIGHT, which no other
                preset measures (the text presets grade throughput and use `hash`
                only as a did-anything-change check). The images are rendered by
@@ -212,7 +236,40 @@ class Entry:
     aliases: list[str] = field(default_factory=list)
     tier_ids: list[str] = field(default_factory=list)   # setParamsByID keys (${MODEL_ID}:l ...)
     groups: list[str] = field(default_factory=list)
+    env: list[str] = field(default_factory=list)       # llama-swap `env:` ("VAR=value")
     health_timeout: int = 300
+
+    @property
+    def env_map(self) -> dict[str, str]:
+        out = {}
+        for item in self.env:
+            k, sep, v = str(item).partition("=")
+            if sep:
+                out[k.strip()] = v.strip()
+        return out
+
+    @property
+    def device(self) -> str:
+        """Which GPU the entry is pinned to, as <api><index> (vk0, hip1, cuda0) --
+        from the entry's own `env:`, which is the ONLY thing that decides it on this
+        box (two cards, and the Vulkan order flipped under us on 2026-09-12). `cpu`
+        for an -ngl 0 entry, '' when nothing is pinned (whatever the binary picks)."""
+        if self.ngl == "0":
+            return "cpu"
+        env = self.env_map
+        for var, tag in (("GGML_VK_VISIBLE_DEVICES", "vk"), ("HIP_VISIBLE_DEVICES", "hip"),
+                         ("ROCR_VISIBLE_DEVICES", "hip"), ("CUDA_VISIBLE_DEVICES", "cuda")):
+            if env.get(var):
+                return tag + env[var].replace(",", "+")
+        return ""
+
+    @property
+    def backend(self) -> str:
+        """The `backend` column: which binary runs the model and on which device,
+        e.g. `fpx@vk0`, `rocm@hip0`, `vulkan@vk1`. Declarative (it is what the entry
+        asks for), which is exactly what a row has to record: the same model on the
+        same box reads 139 t/s on rocm and 8.7 on vulkan (2026-09-15)."""
+        return f"{self.variant}@{self.device}" if self.device else self.variant
 
     @property
     def variant(self) -> str:
@@ -313,6 +370,7 @@ def parse_entry(key: str, m: dict, cfg: dict) -> Entry:
                   for k in ((m.get("filters") or {}).get("setParamsByID") or {})]
     e.groups = [g for g, gd in (cfg.get("groups") or {}).items()
                 if key in (gd.get("members") or [])]
+    e.env = list(m.get("env") or [])
     e.health_timeout = int(cfg.get("healthCheckTimeout") or 300)
     return e
 
@@ -1105,6 +1163,78 @@ REASONING_MESSAGES = [
         "left to right and explain your reasoning step by step.")},
 ]
 
+# ── util: the utility-model workload ────────────────────────────────────────
+# What the "utility" role (ling3 today, not the main chat model) actually runs:
+# Open WebUI's background tasks -- title, tags, retrieval query, follow-ups -- plus
+# n8n's classify/extract nodes. They share one shape that NO other preset has: a
+# long prompt (the whole chat history, pasted into a single user message) for a
+# ~20-token answer. Prefill dominates and the user is watching a spinner, so the
+# row to read is `t`, not t/s. The template below is Open WebUI 0.11's stock title
+# task verbatim in shape; the history is a fixed 4-turn ops conversation (~1.8k
+# tokens) so that every model gets the same input.
+_UTIL_CHAT = '''USER: I have Postgres 16 running in Docker for a few self-hosted apps and right now my only backup is the nightly snapshot of the whole volume. How bad is that?
+
+ASSISTANT: It is better than nothing, but a filesystem snapshot of a live Postgres data directory is a crash-consistent copy, not a clean backup. Restoring it puts the server through crash recovery: it replays WAL from the last checkpoint and usually comes up fine, but "usually" is doing a lot of work in that sentence. If the snapshot is not atomic across the whole data directory -- which it is not if your volume driver copies files one by one, or if pg_wal lives on a different volume -- you can get a torn state that will not start at all, and you will only find out on the day you need it. There is also no way to restore a single database or a single table out of it, and no way to roll back to a point in time between two snapshots.
+
+The usual answer is two layers. The first is a logical dump, pg_dump per database or pg_dumpall for the whole cluster including roles. It is slow to restore for a large database but it is portable, it verifies that the data is actually readable, and it lets you pull one table back. The second is a physical base backup with WAL archiving, pg_basebackup plus archive_command, which is what gives you point-in-time recovery. For a handful of small self-hosted apps the first layer alone is often enough.
+
+USER: Let us start with the dumps then. The containers are managed by Docker Compose, and I would rather not install the Postgres client tools on the host.
+
+ASSISTANT: You do not have to. Run the dump from a throwaway container on the same Compose network, using the same image tag as the server so the client version always matches the server version -- a newer pg_dump can read an older server, but the reverse fails, and having them come from one image tag removes the question entirely.
+
+Something like this as a one-shot service, kept out of the default startup with a profile so a plain compose up does not trigger it:
+
+  backup:
+    image: postgres:16
+    profiles: [backup]
+    environment:
+      PGHOST: db
+      PGUSER: postgres
+      PGPASSWORD_FILE: /run/secrets/pg_password
+    volumes:
+      - ./backups:/backups
+    entrypoint: /bin/sh
+    command: -c "pg_dumpall --clean --if-exists | gzip > /backups/cluster-$$(date +%F).sql.gz"
+
+Then compose run --rm backup from cron or a systemd timer. A few details that matter more than they look. Use --clean --if-exists so the restore is idempotent instead of failing on objects that already exist. Pipe through gzip rather than dumping and compressing afterwards, so you never need twice the disk. Write to a temporary name and rename it into place at the end, because a half-written dump that looks like a finished one is the classic way to discover you have no backups. And check the exit status of pg_dumpall, not of gzip: in a shell pipeline the status you get is the last command in it, which is why set -o pipefail exists.
+
+USER: Good point on pipefail. How do I know the dumps actually restore, without a lot of ceremony?
+
+ASSISTANT: You restore them, on a schedule, automatically. An untested backup is a hypothesis. The cheap version of this is a second one-shot container that starts an empty Postgres, feeds it the newest dump, and then runs a couple of assertions against the result: the restore exited zero, the expected databases exist, a few known tables have a row count above zero, and the newest row in whatever your busiest table is has a timestamp from the last day or two. That last check is the one that catches the interesting failure, where the dump succeeds every night but has been dumping an empty or stale database since somebody changed a user or a search path.
+
+Run it weekly, not nightly, unless the data is small. Keep the output of the last run somewhere you will actually see it -- a file the monitoring stack tails, or a push notification on failure. Silence is not a success signal; if the timer itself stops firing you want to hear about that too, which means alerting on the absence of a recent success rather than on the presence of a failure.
+
+Retention is the other half. Keep something like seven daily, four weekly and six monthly copies, and prune by a script that counts what it is keeping rather than by find -mtime, so that a gap in the dumps cannot silently delete everything. And keep at least one copy off the machine. A backup on the same host protects you from a bad migration, not from a dead disk or a mistyped rm.
+
+USER: Makes sense. Last thing: the apps also have their own upload directories on disk. Should those go in the same job?
+
+ASSISTANT: Keep them in the same schedule but not in the same step. File trees and databases fail differently and restore differently, and you want to be able to run one without the other.
+
+For the files, a snapshotting copy tool beats a tarball: restic or borg against a local repository plus a remote one gives you deduplication, encryption and cheap point-in-time restores, where a nightly tar of an upload directory quickly becomes gigabytes of the same bytes. Both handle the "files changed while I was reading them" case by just recording what they saw, which for user uploads is acceptable, since a newly uploaded file that is missing from tonight will be in tomorrow.
+
+The ordering matters if the database references the files. Back up the files first, then the database. That way the database copy can only reference files that the file copy already has; the other order can leave you with rows pointing at uploads that were never captured. On restore you do the same thing in the same order, and anything uploaded in the window between the two is simply absent, which is a much easier state to reason about than a row that points nowhere.
+'''
+
+UTIL_MESSAGES = [{"role": "user", "content": """### Task:
+Generate a concise, 3-5 word title with an emoji summarizing the chat history.
+### Guidelines:
+- The title should clearly represent the main theme or subject of the conversation.
+- Use emojis that enhance understanding of the topic, but avoid quotation marks or special formatting.
+- Write the title in the chat's primary language; default to English if multilingual.
+- Prioritize accuracy over excessive creativity; keep it clear and simple.
+### Output:
+JSON format: { "title": "your concise title here" }
+### Examples:
+- { "title": "📉 Stock Market Trends" },
+- { "title": "🍪 Perfect Chocolate Chip Recipe" },
+- { "title": "Evolution of Music Streaming" },
+- { "title": "Remote Work Productivity Tips" },
+- { "title": "Artificial Intelligence in Healthcare" },
+- { "title": "🎮 Video Game Development Insights" }
+### Chat History:
+<chat_history>
+""" + _UTIL_CHAT + """</chat_history>"""}]
+
 _WORDS = ("harbour lantern granite ledger monsoon copper orchard velvet quarry saffron meridian "
           "pilgrim tundra anvil cedar compass ember fjord glacier hollow ivory jasper kestrel "
           "lattice marrow nectar obsidian pewter quill raven sable talon umber vessel willow "
@@ -1169,6 +1299,8 @@ class Preset:
             body["messages"] = TOOLS_MESSAGES
             body["tools"] = TOOLS_TOOL
             body["tool_choice"] = "auto"
+        elif self.name == "util":
+            body["messages"] = UTIL_MESSAGES
         elif self.name == "reasoning":
             body["messages"] = REASONING_MESSAGES
             body["chat_template_kwargs"] = {"enable_thinking": True}
@@ -1183,6 +1315,8 @@ PRESETS: dict[str, Preset] = {p.name: p for p in [
     Preset("agent", "chat", 256, True, "agentic tool-calling transcript (~2.5k prompt tokens, 6 tools)"),
     Preset("tools", "chat", 256, False, "single tool call, natural stop; col: call/finish"),
     Preset("reasoning", "chat", 512, True, "enable_thinking on; col: think"),
+    Preset("util", "chat", 64, False, "utility-model task: chat-title generation over a ~1.8k-token "
+           "history, natural stop (~20 tokens out); col: t (wall clock), ptok"),
     Preset("prefill", "completion", 16, True, "pure big-context prefill (--prefill-tokens, default 32768)"),
     Preset("depth", "completion", 256, True, "decode at depth: 256 tokens after a --depth-tokens prompt (default 32768); col: depth"),
     Preset("vision-ocr", "chat", 512, False, "full-page OCR of a rendered receipt; col: acc (character F1)",
@@ -1222,9 +1356,11 @@ class Row:
     model: str
     preset: str
     params: str
+    backend: str = "-"           # <binary>@<device> -- see Entry.backend
     pp: float | None = None
     tg: float | None = None
     tok: int | None = None
+    wall: float | None = None    # seconds, end to end -- the `t (s)` column
     accept: str = "-"
     vram: int | None = None
     gtt: int | None = None
@@ -1244,13 +1380,14 @@ class TablePrinter:
     """Fixed-width table printed incrementally (header once, one line per row as
     results arrive -- a full sweep takes many minutes)."""
 
-    SERVER = [("model", 14, "l"), ("preset", 9, "l"), ("params", 44, "l"), ("pp t/s", 7, "r"),
-              ("tg t/s", 7, "r"), ("tok", 6, "r"), ("accept", 6, "r"), ("vram", 6, "r"),
+    SERVER = [("model", 14, "l"), ("preset", 9, "l"), ("params", 44, "l"), ("backend", 11, "l"),
+              ("pp t/s", 7, "r"),
+              ("tg t/s", 7, "r"), ("tok", 6, "r"), ("t (s)", 6, "r"), ("accept", 6, "r"), ("vram", 6, "r"),
               ("gtt", 5, "r"), ("hash", 12, "l"), ("notes", 0, "l")]
-    KERNEL = [("model", 14, "l"), ("variant", 8, "l"), ("params", 44, "l"), ("pp512", 14, "r"),
+    KERNEL = [("model", 14, "l"), ("backend", 11, "l"), ("params", 44, "l"), ("pp512", 14, "r"),
               ("tg128", 12, "r"), ("pp512@8k", 14, "r"), ("tg128@8k", 12, "r"), ("build", 16, "l"),
               ("notes", 0, "l")]
-    PPL = [("model", 14, "l"), ("variant", 7, "l"), ("file", 40, "l"), ("chunks", 6, "r"),
+    PPL = [("model", 14, "l"), ("backend", 11, "l"), ("file", 40, "l"), ("chunks", 6, "r"),
            ("ppl", 18, "r"), ("kld", 11, "r"), ("same top p", 10, "r"), ("notes", 0, "l")]
 
     def __init__(self, mode: str, enabled: bool = True):
@@ -1280,15 +1417,15 @@ class TablePrinter:
             notes = " ".join([f"{k}={v}" for k, v in r.extra.items()] + r.flags)
         if self.mode == "kernel":
             k = r.kernel
-            cells = [r.model, k.get("variant", "-"), r.params, k.get("pp512", "-"), k.get("tg128", "-"),
+            cells = [r.model, r.backend, r.params, k.get("pp512", "-"), k.get("tg128", "-"),
                      k.get("pp512@8k", "-"), k.get("tg128@8k", "-"), k.get("build", "-"), notes]
         elif self.mode == "ppl":
             k = r.ppl
-            cells = [r.model, k.get("variant", "-"), k.get("file", "-"), k.get("chunks", "-"),
+            cells = [r.model, r.backend, k.get("file", "-"), k.get("chunks", "-"),
                      k.get("ppl", "-"), k.get("kld", "-"), k.get("same_top_p", "-"), notes]
         else:
-            cells = [r.model, r.preset, r.params, _num(r.pp), _num(r.tg),
-                     "-" if r.tok is None else str(r.tok), r.accept,
+            cells = [r.model, r.preset, r.params, r.backend, _num(r.pp), _num(r.tg),
+                     "-" if r.tok is None else str(r.tok), _num(r.wall, 2), r.accept,
                      "-" if r.vram is None else fmt_gib(r.vram),
                      "-" if r.gtt is None else fmt_gib(r.gtt), r.hash, notes]
         print(self._line(cells), flush=True)
@@ -1306,7 +1443,7 @@ def print_md(rows: list[Row], mode: str, today: str) -> None:
             res = f"PPL **{k.get('ppl', '-')}**"
             if k.get("kld"):
                 res += f", mean KLD **{k['kld']}**, same top p {k.get('same_top_p', '-')}"
-            print(f"| {today} | `{r.model}` | llama-perplexity {k.get('variant', '')} "
+            print(f"| {today} | `{r.model}` | llama-perplexity {r.backend} "
                   f"`{k.get('cmd', '')}` | {res} | {k.get('file', '')} {' '.join(r.flags)} |")
         return
     if mode == "kernel":
@@ -1316,7 +1453,7 @@ def print_md(rows: list[Row], mode: str, today: str) -> None:
             k = r.kernel
             res = (f"pp512 **{k.get('pp512', '-')}**, tg128 **{k.get('tg128', '-')}**, "
                    f"pp512@8k {k.get('pp512@8k', '-')}, tg128@8k {k.get('tg128@8k', '-')}")
-            print(f"| {today} | `{r.model}` | llama-bench {k.get('variant', '')} `{k.get('cmd', '')}` "
+            print(f"| {today} | `{r.model}` | llama-bench {r.backend} `{k.get('cmd', '')}` "
                   f"({r.params}) | {res} | build {k.get('build', '?')} {' '.join(r.flags)} |")
         return
     print("| Date | Model / entry | Config under test | Result | Why / notes |")
@@ -1325,10 +1462,12 @@ def print_md(rows: list[Row], mode: str, today: str) -> None:
         if r.error:
             print(f"| {today} | `{r.model}` | {r.preset} ({r.params}) | FAILED: {r.error} | |")
             continue
-        res = (f"pp **{_num(r.pp)}** / tg **{_num(r.tg)}** t/s, {r.tok} tok, accept {r.accept}, "
+        res = (f"pp **{_num(r.pp)}** / tg **{_num(r.tg)}** t/s, {r.tok} tok, "
+               f"{_num(r.wall, 2)} s, accept {r.accept}, "
                f"vram {fmt_gib(r.vram or 0)}, gtt {fmt_gib(r.gtt or 0)}, hash `{r.hash}`")
         notes = " ".join([f"{k}={v}" for k, v in r.extra.items()] + r.flags)
-        print(f"| {today} | `{r.model}` | benchmark `{r.preset}` greedy ({r.params}) | {res} | {notes} |")
+        print(f"| {today} | `{r.model}` | benchmark `{r.preset}` {mode} ({r.backend}, {r.params}) "
+              f"| {res} | {notes} |")
 
 
 def print_json(rows: list[Row], meta: dict) -> None:
@@ -1377,6 +1516,7 @@ def measure_vision(target: Target, entry: Entry, preset: Preset, opts: argparse.
       miss  cases scored below 0.5, by name
     """
     scores, ts, texts, misses = [], [], [], []
+    t0 = time.monotonic()
     for name in preset.cases:
         case = VISION_CASES[name]
         body = case.body(target.model)
@@ -1404,7 +1544,8 @@ def measure_vision(target: Target, entry: Entry, preset: Preset, opts: argparse.
                "prompt_n": sum(t.get("prompt_n", 0) or 0 for t in ts),
                "predicted_n": sum(t.get("predicted_n", 0) or 0 for t in ts),
                "draft_n": sum(t.get("draft_n", 0) or 0 for t in ts),
-               "draft_n_accepted": sum(t.get("draft_n_accepted", 0) or 0 for t in ts)}
+               "draft_n_accepted": sum(t.get("draft_n_accepted", 0) or 0 for t in ts),
+               "wall_s": time.monotonic() - t0}   # all cases together
     extras = {"acc": f"{100 * statistics.mean(scores):.0f}%",
               "ptok": str(int(med("prompt_n")))}
     if misses:
@@ -1420,6 +1561,7 @@ def measure(target: Target, entry: Entry, preset: Preset, opts: argparse.Namespa
         return measure_vision(target, entry, preset, opts, sampled)
     body = preset.body(target.model, entry, opts)
     extras: dict = {}
+    t0 = time.monotonic()
     if sampled:
         # production sampling through llama-swap's filtered OpenAI route
         if "prompt" in body:
@@ -1439,6 +1581,7 @@ def measure(target: Target, entry: Entry, preset: Preset, opts: argparse.Namespa
         d = target.post("/v1/chat/completions", body)
         msg = d["choices"][0]["message"]
         h = hashlib.sha256(json.dumps(msg, sort_keys=True).encode()).hexdigest()[:12]
+    wall = time.monotonic() - t0
     if msg is not None:
         if preset.name in ("agent", "tools"):
             extras["call"] = "yes" if msg.get("tool_calls") else "no"
@@ -1446,11 +1589,15 @@ def measure(target: Target, entry: Entry, preset: Preset, opts: argparse.Namespa
             extras["finish"] = d["choices"][0].get("finish_reason", "?")
         if preset.name == "reasoning":
             extras["think"] = "yes" if (msg.get("reasoning_content") or "").strip() else "no"
-    t = d.get("timings") or {}
+    # wall_s is ours, not llama-server's: the client-side round trip, which is what
+    # the `t` column reports and the only honest number for a short-output preset.
+    t = {**(d.get("timings") or {}), "wall_s": wall}
     if preset.name == "prefill":
         extras["ttft"] = f"{t.get('prompt_ms', 0) / 1000:.1f}s"
     if preset.name == "depth":
         extras["depth"] = t.get("prompt_n")
+    if preset.name == "util":
+        extras["ptok"] = str(int(t.get("prompt_n") or 0))
     return t, h, extras
 
 
@@ -1503,12 +1650,12 @@ def bench_server(target: Target, entry: Entry, presets: list[Preset], opts: argp
     try:
         warmup(target, sampled)
     except Exception as ex:  # load failure: one FAILED row for the whole model
-        rows = [Row(target.model, p.name, params, error=str(ex)) for p in presets]
+        rows = [Row(target.model, p.name, params, entry.backend, error=str(ex)) for p in presets]
         for r in rows:
             emit(r)
         return rows
     for p in presets:
-        row = Row(target.model, p.name, params)
+        row = Row(target.model, p.name, params, entry.backend)
         try:
             preset_warmup(target, entry, p, opts, sampled)
             before = token_counters(metrics_target)
@@ -1530,6 +1677,7 @@ def bench_server(target: Target, entry: Entry, presets: list[Preset], opts: argp
             drafted = t.get("draft_n") or 0
             row.accept = f"{100 * t.get('draft_n_accepted', 0) / drafted:.0f}%" if drafted else "-"
             row.hash = runs[0][1]   # first run only -- see the docstring on hashes
+            row.wall = statistics.median(r[0].get("wall_s", 0) or 0 for r in runs) or None
             row.extra = runs[0][2]
             row.vram, row.gtt = vram_mib(), gtt_mib()
             if (not uma and opts.spill_threshold and entry.ngl == "all" and entry.fit != "on"
@@ -1546,6 +1694,21 @@ def bench_server(target: Target, entry: Entry, presets: list[Preset], opts: argp
 
 
 # ── kernel-level runner ──────────────────────────────────────────────────────
+def entry_env(entry: Entry) -> dict[str, str]:
+    """This process's env plus the entry's own `env:`. --kernel/--standalone/--ppl
+    spawn a binary themselves, and without this they inherit the CONTAINER's device
+    visibility instead of the entry's: a `small`-group entry pinned to the 7800 XT
+    would be measured on the XTX, silently. llama-swap applies the same env in
+    server mode, so all four modes now agree with the `backend` column."""
+    return {**os.environ, **entry.env_map}
+
+
+def entry_env_prefix(entry: Entry) -> str:
+    """The entry's env as a `VAR=value ` prefix for the echoed command line."""
+    m = entry.env_map
+    return "".join(f"{k}={shlex.quote(v)} " for k, v in m.items())
+
+
 def kernel_argv(entry: Entry, gguf: str, opts: argparse.Namespace, binary: str) -> list[str]:
     argv = [binary, "-m", gguf]
     if opts.std:
@@ -1581,7 +1744,8 @@ def kernel_argv(entry: Entry, gguf: str, opts: argparse.Namespace, binary: str) 
 
 def bench_kernel(entry: Entry, opts: argparse.Namespace, variant: str, swap: Swap | None, guard: Guard) -> Row:
     binary = "llama-bench" + ("" if variant == "vulkan" else f"-{variant}")
-    row = Row(entry.key, "kernel", entry.params(), kernel={"variant": variant})
+    row = Row(entry.key, "kernel", entry.params(),
+              f"{variant}@{entry.device}" if entry.device else variant, kernel={"variant": variant})
     if not shutil.which(binary):
         have = sorted(os.path.basename(p) for d in os.environ["PATH"].split(":")
                       for p in glob.glob(os.path.join(d, "llama-bench*")))
@@ -1594,9 +1758,10 @@ def bench_kernel(entry: Entry, opts: argparse.Namespace, variant: str, swap: Swa
         return row
     argv = kernel_argv(entry, gguf, opts, binary)
     row.kernel["cmd"] = " ".join(shlex.quote(a) for a in argv[1:])
-    print(f"+ {' '.join(shlex.quote(a) for a in argv)}", file=sys.stderr, flush=True)
+    print(f"+ {entry_env_prefix(entry)}{' '.join(shlex.quote(a) for a in argv)}", file=sys.stderr, flush=True)
     try:
-        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=None, timeout=opts.timeout * 4, check=False)
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=None, env=entry_env(entry),
+                              timeout=opts.timeout * 4, check=False)
     except subprocess.TimeoutExpired:
         row.error = "llama-bench timed out"
         return row
@@ -1697,6 +1862,7 @@ def bench_ppl(entry: Entry, opts: argparse.Namespace, variant: str | None, swap:
         row.error = str(ex)
         return row
     row.ppl["variant"] = used
+    row.backend = f"{used}@{entry.device}" if entry.device else used
     row.ppl["file"] = os.path.basename(gguf)
     row.ppl["chunks"] = str(opts.ppl_chunks)
     saving = bool(opts.kld_base) and not os.path.exists(opts.kld_base)
@@ -1706,12 +1872,12 @@ def bench_ppl(entry: Entry, opts: argparse.Namespace, variant: str | None, swap:
              f"and expect a large file.")
     argv = ppl_argv(entry, gguf, corpus, opts, binary)
     row.ppl["cmd"] = " ".join(shlex.quote(a) for a in argv[1:])
-    print(f"+ {' '.join(shlex.quote(a) for a in argv)}", file=sys.stderr, flush=True)
+    print(f"+ {entry_env_prefix(entry)}{' '.join(shlex.quote(a) for a in argv)}", file=sys.stderr, flush=True)
     try:
         # stderr is merged in: llama-perplexity prints the running estimate and the
         # final line there, and it is the only progress the user sees on a long run.
         proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=opts.timeout * 8, check=False)
+                              env=entry_env(entry), timeout=opts.timeout * 8, check=False)
     except subprocess.TimeoutExpired:
         row.error = "llama-perplexity timed out"
         return row
@@ -1769,8 +1935,10 @@ class Standalone:
         argv = standalone_argv(self.entry, self.variant, self.port)
         if not shutil.which(argv[0]):
             raise UserError(f"{argv[0]} not in this image")
-        print(f"+ {' '.join(shlex.quote(a) for a in argv)}", file=sys.stderr, flush=True)
-        self.proc = subprocess.Popen(argv, stdout=self.log, stderr=subprocess.STDOUT)
+        print(f"+ {entry_env_prefix(self.entry)}{' '.join(shlex.quote(a) for a in argv)}",
+              file=sys.stderr, flush=True)
+        self.proc = subprocess.Popen(argv, stdout=self.log, stderr=subprocess.STDOUT,
+                                     env=entry_env(self.entry))
         deadline = time.time() + max(self.entry.health_timeout, 60)
         base = f"http://127.0.0.1:{self.port}"
         while time.time() < deadline:
@@ -1809,8 +1977,8 @@ def build_parser() -> argparse.ArgumentParser:
                + "\ngroups:\n" + "\n".join(f"  {n:<12} {', '.join(v)}" for n, v in PRESET_GROUPS.items())
                + "\n\nexamples:\n  benchmark qwen38                      # all text presets, via llama-swap (production sampling)\n"
                  "  benchmark qwen38:l                    # a reasoning alias, with its filters\n"
-                 "  benchmark --greedy --prompt prose,json qwen38 qwen38-hh   # deterministic, hash-comparable\n"
                  "  benchmark --prompt fast qwen38        # ~1 min smoke test (prose, json, tools)\n"
+                 "  benchmark --greedy --prompt prose,json qwen38 qwen38-hh   # deterministic, hash-comparable\n"
                  "  benchmark --prompt vision --vision-answers qwen35-4b qwen35-2b lfm25-vl\n"
                  "  benchmark --kernel --std --unload qwen38\n"
                  "  benchmark --standalone --variant rocm --unload qwen38\n"
@@ -1821,12 +1989,13 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--kernel", action="store_true", help="llama-bench on the entry's GGUF (hardware/build number)")
     mode.add_argument("--standalone", action="store_true", help="spawn llama-server-<variant> with the entry's cmd")
     mode.add_argument("--greedy", action="store_true",
-                      help="via llama-swap /upstream/<model>/ with a greedy body -- THE DEFAULT: "
-                           "deterministic, hash column filled, filters bypassed (aliases bench their parent)")
+                      help="via llama-swap /upstream/<model>/ with a greedy body: deterministic, hash column "
+                           "filled, filters bypassed (aliases bench their parent) -- for build/config A/Bs; "
+                           "OVERSTATES decode vs the sampled default")
     mode.add_argument("--sampled", action="store_true",
                       help="via llama-swap /v1/chat/completions with the entry's filters (production sampling) "
-                           "-- what users actually get; slower than the greedy default where speculative decoding "
-                           "loses acceptance at temperature")
+                           "-- THE DEFAULT since 2026-09-15, what users actually get; no hash, so use --repeat "
+                           "for a close comparison")
     mode.add_argument("--ppl", action="store_true",
                       help="llama-perplexity on the entry's GGUF over wikitext-2 (QUALITY, not speed: "
                            "a cheap screen for a quant/requant -- these rows do not belong in a speed log)")
@@ -1878,11 +2047,11 @@ def build_parser() -> argparse.ArgumentParser:
 def cmd_list(cfg: Config) -> None:
     rows = []
     for e in cfg.llama_entries():
-        rows.append([e.key, e.variant, ",".join(e.groups) or "-", e.params(),
+        rows.append([e.key, e.backend, ",".join(e.groups) or "-", e.params(),
                      f"{'+'.join(e.caps_in) or '-'}->{'+'.join(e.caps_out) or '-'}",
                      "unlisted" if e.unlisted else ("text" if e.is_text else "-"),
                      ",".join(e.tier_ids + e.aliases) or "-"])
-    hdr = ["model", "variant", "group", "params", "caps", "bench", "aliases"]
+    hdr = ["model", "backend", "group", "params", "caps", "bench", "aliases"]
     widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(hdr)]
     print("  ".join(h.ljust(w) for h, w in zip(hdr, widths)))
     for r in rows:
@@ -1910,15 +2079,16 @@ def main() -> int:
     # Modes that run a llama.cpp binary directly instead of going through llama-swap.
     # They need the GPU to themselves, so they share the resident-model preflight.
     offline = opts.kernel or opts.standalone or opts.ppl
-    # llama-swap route modes: GREEDY is the default since 2026-09-12 (it was
-    # sampled from 09-08); --sampled is the opt-out. Rationale: nearly every row
-    # in the speed log is an A/B ("did this config/quant/build help?"), which
-    # needs determinism and the output hash, and greedy's lower variance makes a
-    # single run trustworthy. The cost is that greedy OVERSTATES real-world
-    # decode, because draft acceptance falls at production temperature -- measured
-    # on qwen38-fast 2026-09-12: prose +26 % (71.4 vs 56.7 t/s, accept 44 vs 29 %),
-    # tools +7 %, json +2 %. Quote --sampled for "what users get".
-    sampled = opts.sampled and not offline
+    # llama-swap route modes: SAMPLED is the default again since 2026-09-15
+    # (greedy held it 09-12..09-15, sampled 09-08..09-12); --greedy is now the
+    # opt-out. Rationale for going back: the default should be the number a user
+    # can actually feel, and greedy is not it -- it OVERSTATES decode because draft
+    # acceptance collapses at production temperature (qwen38-fast 2026-09-12: prose
+    # +26 %, 71.4 vs 56.7 t/s, accept 44 vs 29 %; tools +7 %; json +2 %), and the
+    # filters it bypasses (setParams sampling, the :l/:m/:x tiers) are part of what
+    # the entry IS. Pass --greedy for a build/quant/flag A/B, where determinism and
+    # the output hash are the point; never mix the two in one comparison.
+    sampled = not opts.greedy and not offline
     if opts.vision_dump:
         os.makedirs(opts.vision_dump, exist_ok=True)
         for name, build in IMAGES.items():
@@ -1987,8 +2157,9 @@ def main() -> int:
         print(f"benchmark {today} mode={mode} {what} "
               f"llama.cpp={meta['llama_vulkan_commit'][:8]}"
               + (f" prs={meta['llama_patches'].replace(' ', ',')}" if meta['llama_patches'] else "")
-              + (" SAMPLED -- production sampling, not comparable with --greedy rows" if sampled else "")
-              + (" GREEDY -- deterministic; OVERSTATES decode vs production sampling (accept falls at temperature)"
+              + (" SAMPLED (default) -- what users get; no hash, not comparable with --greedy rows"
+                 if sampled else "")
+              + (" GREEDY -- deterministic; OVERSTATES decode vs the sampled default (accept falls at temperature)"
                  if mode == "greedy" else "") + "\n", flush=True)
         table.header()
 
@@ -2014,7 +2185,8 @@ def main() -> int:
                     new = bench_server(tgt, entry, presets, opts, False, f"variant={variant}",
                                        baseline_gtt, uma, emit=lambda r: None, guard=guard, metrics_target=tgt)
             except (UserError, RuntimeError) as ex:
-                new = [Row(entry.key, p.name, entry.params(f"variant={variant}"), error=str(ex)) for p in presets]
+                new = [Row(entry.key, p.name, entry.params(f"variant={variant}"), error=str(ex))
+                       for p in presets]
             if swap and not guard.enabled:
                 try:
                     if swap.running():
@@ -2023,6 +2195,8 @@ def main() -> int:
                 except UserError:
                     pass
             for r in new:   # printed after teardown so CONTAMINATED can be included
+                # the binary is --variant's, the device is still the entry's pin
+                r.backend = f"{variant}@{entry.device}" if entry.device else variant
                 table.row(r)
             rows += new
             continue
