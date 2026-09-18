@@ -282,17 +282,19 @@ ARG LLAMA_COMMIT="master"
 # all clean). Nothing here is measured on this box yet -- this is the
 # "full experimental" set, and every entry is a candidate for removal if the
 # post-build benchmark says so:
-#   #25666 Vulkan: do NOT enable MMVQ for speculative-decode steps on AMD. A
-#          spec step evaluates n = 1 + n_draft, which trips the "n > 1 means a
-#          batch" early-out in ggml_vk_should_use_mmvq() and takes the MMVQ
-#          path, where the Q8_1 activation quantization neither amortizes at
-#          that n NOR keeps the logits identical -- so it lowers draft
-#          ACCEPTANCE as well as speed. gfx1151, 35B-A3B MoE + MTP @33k: TG
-#          75.2 -> 84.9 t/s (+12.9 %), acceptance 72-75 % -> 83-85 %, prefill
-#          unchanged. Applies to the stock-Vulkan MTP entries (qwen38-bart,
-#          -hau, -hui); NOT to qwen38-fast (fpx fork takes no PRs) and NOT to
-#          qwen38-flash (HIP). Only gfx1151 data exists upstream -- the author
-#          is asking for discrete-GPU numbers, which this box can produce.
+#   #25666 (NOW CARRIED AS patches/25666-rebased.patch, see the 2026-09-18
+#          revision below) Vulkan: do NOT enable MMVQ for speculative-decode
+#          steps on AMD. A spec step evaluates n = 1 + n_draft, which trips
+#          the "n > 1 means a batch" early-out in ggml_vk_should_use_mmvq()
+#          and takes the MMVQ path, where the Q8_1 activation quantization
+#          neither amortizes at that n NOR keeps the logits identical -- so
+#          it lowers draft ACCEPTANCE as well as speed. gfx1151, 35B-A3B MoE
+#          + MTP @33k: TG 75.2 -> 84.9 t/s (+12.9 %), acceptance 72-75 % ->
+#          83-85 %, prefill unchanged. Applies to the stock-Vulkan MTP
+#          entries (qwen38-bart, -hau, -hui); NOT to qwen38-fast (fpx fork
+#          takes no PRs) and NOT to qwen38-flash (HIP). Only gfx1151 data
+#          exists upstream -- the author is asking for discrete-GPU numbers,
+#          which this box can produce.
 #   #28927 context: drop the sched_need_reserve from set_causal_attn(). The
 #          causal flag only changes KQ mask CONTENTS, not graph topology, and
 #          allow_reuse() already compares it. mtmd toggles it twice per image
@@ -312,7 +314,10 @@ ARG LLAMA_COMMIT="master"
 #          than one physical batch simply does not work, which is why the
 #          qwen3-rerank entry carries --ubatch-size 8192; with this, that
 #          workaround can go and documents may exceed 8192.
-#   #28901 qwen4exp: fused hyper-connection ops (gated hc_pre, null-comb
+#   #28901 MERGED UPSTREAM 2026-09-16 and REMOVED FROM THE LIST 2026-09-18
+#          (it is in master now; the checkout script had started skipping it
+#          with a "closed on GitHub" notice). Kept here for the reasoning:
+#          qwen4exp fused hyper-connection ops (gated hc_pre, null-comb
 #          hc_post). MATTERS FOR HIP, NOT VULKAN: it adds ggml-cuda/dsv4-hc.cu
 #          with both variants templated and leaves the CUDA supports_op alone,
 #          while its Vulkan hunk REJECTS both new variants (gate param != 0,
@@ -369,23 +374,40 @@ ARG LLAMA_COMMIT="master"
 #   #25483 (skip unneeded MoE work in the coopmat1 path) measured +0.3 % here
 #          on 09-06; not worth the rebase burden.
 # Revised 2026-09-15 against master 38a5b42d, after the CI build failed:
-#   #28243 (qwen4exp MTP) DROPPED FROM THE LIST and carried as
-#          patches/28243-rebased.patch instead. Master moved the grouped-norm
-#          gammas (hc_*_norm, ple_norm_*) from a flat [hc_dim] tensor to
-#          [n_embd, hc] + TENSOR_ALLOW_RESHAPE so build_hc_mix scales the
-#          stream without a graph reshape, while the PR rewrote the same lines
-#          to load them with MTP-aware flags -- three conflicting hunks in
-#          src/models/qwen4exp.cpp, nothing else in the eight-PR set. The
-#          rebased patch keeps both sides (master's shapes, the PR's flags) and
-#          gives the PR's own nextn.hc_head_norm the same [n_embd, hc] shape,
-#          since it feeds the same build_hc_mix. Drop the patch and put #28243
-#          back in the list the moment the author rebases it -- this is the MTP
-#          draft head qwen38-flash runs on, so it cannot simply be left out.
+#   #28243 (qwen4exp MTP) was DROPPED FROM THE LIST here and carried as
+#          patches/28243-rebased.patch, because master had moved the
+#          grouped-norm gammas (hc_*_norm, ple_norm_*) from a flat [hc_dim]
+#          tensor to [n_embd, hc] + TENSOR_ALLOW_RESHAPE while the PR rewrote
+#          the same lines to load them with MTP-aware flags. RESTORED TO THE
+#          LIST 2026-09-18, in its original slot after 27952: the author
+#          rebased the PR that day and it merges clean again, so the local
+#          patch is gone (see patches/README.md). Note it had ALREADY gone
+#          stale against master 5b335f413 -- its src/llama-arch.h hunk no
+#          longer applied -- so this was a second latent build failure, not
+#          just tidying. This is the MTP draft head qwen38-flash runs on.
+# Revised 2026-09-18 after the CI build failed (run 35354559401). Verified by
+# building the llama-vulkan stage locally against master ec9281505, which is
+# newer than the 5b335f413 the failed run pinned:
+#   #25666 (Vulkan MMVQ / spec-decode) DROPPED FROM THE LIST and carried as
+#          patches/25666-rebased.patch instead. The PR itself has not moved
+#          since 2026-08-26 -- master drifted under it, and GitHub marks it
+#          CONFLICTING upstream too. The conflict is pure placement, not
+#          substance: master deleted the "// Device tuning" comment that the
+#          PR's first hunk anchors its new MMVQ_MAX_DECODE_LIKE_N constant to,
+#          so git had nothing to attach the insertion to; the other three hunks
+#          still auto-merge. The rebased patch is byte-for-byte the PR's own
+#          four-hunk diff, re-anchored -- nothing was reinterpreted. Verified
+#          2026-09-18: every other PR in the list merges clean on ec9281505,
+#          this is the only one that does not. Drop the patch and
+#          put #25666 back in the list the moment the author rebases it.
+#          STILL UNMEASURED on this box (see the 09-15 note) -- if `benchmark`
+#          does not show the gfx1151 gain on an XTX, delete it rather than
+#          carrying a patch for nothing.
 # patches/*.patch (local rebased patches) apply after the merges to both
 # backends -- so a patch has to be generated against the tree with ALL the
 # other merges in it, not just against master (see patches/README.md).
 # Retire PRs from the list as they merge (the build says so).
-ARG LLAMA_PATCHES="27952 28265 28213 28699 27210 28333 25592 25666 28927 28956 28876 28901 28943"
+ARG LLAMA_PATCHES="27952 28243 28265 28213 28699 27210 28333 25592 28927 28956 28876 28943"
 
 # Cache key only (see LLAMA_SWAP_PATCHES_HEADS).
 ARG LLAMA_PATCHES_HEADS=""
@@ -652,10 +674,16 @@ done
 # ggml silently falls back to the CPU -- measured 2026-09-18: a lost definition in the
 # Vulkan backend produced a binary that passed every canary above, answered correctly,
 # and ran Qwen3.8-27B at 2.7 t/s on 16 CPU threads. ldd -r resolves symbols, ldd does not.
+# APPEND to LD_LIBRARY_PATH, never replace it: the multiarch ROCm toolchain reaches
+# /opt/rocm/lib ONLY through that variable (it adds no ld.so.conf entry -- the runtime
+# image does, which is why the shipped libs resolve there), so overwriting it hides
+# libamdhip64.so and reports every HIP symbol as undefined. Treat "not found" as fatal
+# too, so a dependency that cannot be located can never masquerade as a clean run.
+LDD_PATH="$OUT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 for lib in "$OUT"/libggml-*.so; do
-    if LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep -q "undefined symbol"; then
+    if LD_LIBRARY_PATH="$LDD_PATH" ldd -r "$lib" 2>&1 | grep -qE "undefined symbol|not found"; then
         echo "FATAL: $lib has undefined symbols (would fail dlopen -> silent CPU fallback):" >&2
-        LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep "undefined symbol" | head -5 >&2; exit 1; fi
+        LD_LIBRARY_PATH="$LDD_PATH" ldd -r "$lib" 2>&1 | grep -E "undefined symbol|not found" | head -5 >&2; exit 1; fi
 done
 { echo "llama_vulkan_commit: $(cat .base-commit) (requested: ${LLAMA_COMMIT}; merged tree $(git rev-parse --short HEAD))";
   echo "llama_patches: $(cat .merged-prs)";
@@ -747,10 +775,16 @@ done
 # ggml silently falls back to the CPU -- measured 2026-09-18: a lost definition in the
 # Vulkan backend produced a binary that passed every canary above, answered correctly,
 # and ran Qwen3.8-27B at 2.7 t/s on 16 CPU threads. ldd -r resolves symbols, ldd does not.
+# APPEND to LD_LIBRARY_PATH, never replace it: the multiarch ROCm toolchain reaches
+# /opt/rocm/lib ONLY through that variable (it adds no ld.so.conf entry -- the runtime
+# image does, which is why the shipped libs resolve there), so overwriting it hides
+# libamdhip64.so and reports every HIP symbol as undefined. Treat "not found" as fatal
+# too, so a dependency that cannot be located can never masquerade as a clean run.
+LDD_PATH="$OUT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 for lib in "$OUT"/libggml-*.so; do
-    if LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep -q "undefined symbol"; then
+    if LD_LIBRARY_PATH="$LDD_PATH" ldd -r "$lib" 2>&1 | grep -qE "undefined symbol|not found"; then
         echo "FATAL: $lib has undefined symbols (would fail dlopen -> silent CPU fallback):" >&2
-        LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep "undefined symbol" | head -5 >&2; exit 1; fi
+        LD_LIBRARY_PATH="$LDD_PATH" ldd -r "$lib" 2>&1 | grep -E "undefined symbol|not found" | head -5 >&2; exit 1; fi
 done
 # The whole point of this stage: the ROCmFPx tensor types and adaptive
 # drafting must be present. If a later upstream merge in the fork drops
@@ -851,10 +885,16 @@ done
 # ggml silently falls back to the CPU -- measured 2026-09-18: a lost definition in the
 # Vulkan backend produced a binary that passed every canary above, answered correctly,
 # and ran Qwen3.8-27B at 2.7 t/s on 16 CPU threads. ldd -r resolves symbols, ldd does not.
+# APPEND to LD_LIBRARY_PATH, never replace it: the multiarch ROCm toolchain reaches
+# /opt/rocm/lib ONLY through that variable (it adds no ld.so.conf entry -- the runtime
+# image does, which is why the shipped libs resolve there), so overwriting it hides
+# libamdhip64.so and reports every HIP symbol as undefined. Treat "not found" as fatal
+# too, so a dependency that cannot be located can never masquerade as a clean run.
+LDD_PATH="$OUT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 for lib in "$OUT"/libggml-*.so; do
-    if LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep -q "undefined symbol"; then
+    if LD_LIBRARY_PATH="$LDD_PATH" ldd -r "$lib" 2>&1 | grep -qE "undefined symbol|not found"; then
         echo "FATAL: $lib has undefined symbols (would fail dlopen -> silent CPU fallback):" >&2
-        LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep "undefined symbol" | head -5 >&2; exit 1; fi
+        LD_LIBRARY_PATH="$LDD_PATH" ldd -r "$lib" 2>&1 | grep -E "undefined symbol|not found" | head -5 >&2; exit 1; fi
 done
 # The whole point of this stage: the ROCmFPx tensor types and adaptive
 # drafting must be present. If a later upstream merge in the fork drops
@@ -1259,10 +1299,16 @@ done
 # ggml silently falls back to the CPU -- measured 2026-09-18: a lost definition in the
 # Vulkan backend produced a binary that passed every canary above, answered correctly,
 # and ran Qwen3.8-27B at 2.7 t/s on 16 CPU threads. ldd -r resolves symbols, ldd does not.
+# APPEND to LD_LIBRARY_PATH, never replace it: the multiarch ROCm toolchain reaches
+# /opt/rocm/lib ONLY through that variable (it adds no ld.so.conf entry -- the runtime
+# image does, which is why the shipped libs resolve there), so overwriting it hides
+# libamdhip64.so and reports every HIP symbol as undefined. Treat "not found" as fatal
+# too, so a dependency that cannot be located can never masquerade as a clean run.
+LDD_PATH="$OUT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 for lib in "$OUT"/libggml-*.so; do
-    if LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep -q "undefined symbol"; then
+    if LD_LIBRARY_PATH="$LDD_PATH" ldd -r "$lib" 2>&1 | grep -qE "undefined symbol|not found"; then
         echo "FATAL: $lib has undefined symbols (would fail dlopen -> silent CPU fallback):" >&2
-        LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep "undefined symbol" | head -5 >&2; exit 1; fi
+        LD_LIBRARY_PATH="$LDD_PATH" ldd -r "$lib" 2>&1 | grep -E "undefined symbol|not found" | head -5 >&2; exit 1; fi
 done
 { echo "llama_rocm_commit: $(cat .base-commit) (requested: ${LLAMA_COMMIT}; merged tree $(git rev-parse --short HEAD))";
   echo "llama_rocm_patches: $(cat .merged-prs)";
@@ -1352,10 +1398,16 @@ done
 # ggml silently falls back to the CPU -- measured 2026-09-18: a lost definition in the
 # Vulkan backend produced a binary that passed every canary above, answered correctly,
 # and ran Qwen3.8-27B at 2.7 t/s on 16 CPU threads. ldd -r resolves symbols, ldd does not.
+# APPEND to LD_LIBRARY_PATH, never replace it: the multiarch ROCm toolchain reaches
+# /opt/rocm/lib ONLY through that variable (it adds no ld.so.conf entry -- the runtime
+# image does, which is why the shipped libs resolve there), so overwriting it hides
+# libamdhip64.so and reports every HIP symbol as undefined. Treat "not found" as fatal
+# too, so a dependency that cannot be located can never masquerade as a clean run.
+LDD_PATH="$OUT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 for lib in "$OUT"/libggml-*.so; do
-    if LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep -q "undefined symbol"; then
+    if LD_LIBRARY_PATH="$LDD_PATH" ldd -r "$lib" 2>&1 | grep -qE "undefined symbol|not found"; then
         echo "FATAL: $lib has undefined symbols (would fail dlopen -> silent CPU fallback):" >&2
-        LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep "undefined symbol" | head -5 >&2; exit 1; fi
+        LD_LIBRARY_PATH="$LDD_PATH" ldd -r "$lib" 2>&1 | grep -E "undefined symbol|not found" | head -5 >&2; exit 1; fi
 done
 { echo "llama_engram_commit: $(git rev-parse HEAD) (${ENGRAM_REPO} @ ${ENGRAM_BRANCH})";
   echo "llama_engram_targets: ${ENGRAM_TARGETS}"; } > /install/build-info/llama-engram
