@@ -94,7 +94,7 @@ Things the numbers have taught us (keep in mind when reading a row):
   * Benchmark on an idle box; single runs are +-5%, the first run after an image
     switch can read ~10% low.
   * backend -- own column, since 2026-09-15: which binary serves the entry and on
-               which device, `<variant>@<api><index>` -- vulkan/rocm/fpx/engram (the
+               which device, `<variant>@<api><index>` -- vulkan/rocm/fpx/rdna3/engram (the
                llama-server-<suffix> the cmd names) @ vk0/vk1/hip0/cuda0 (the entry's
                own `env:` pin), `cpu` for an -ngl 0 entry, and no @ when nothing is
                pinned. Never omit it from a quoted row: this box has two cards and
@@ -180,7 +180,7 @@ GREEDY = {"temperature": 0, "top_k": 1, "seed": 42, "id_slot": 0}
 STANDARD_BENCH = ["-fa", "1", "-ctk", "q8_0", "-ctv", "q4_0", "-b", "2048", "-ub", "512",
                   "-p", "512", "-n", "128", "-d", "0,8192"]
 FIT_MARGIN_MIB = 1024  # llama-server's --fit on default margin (1 GiB)
-VARIANTS = ("vulkan", "rocm", "engram", "fpx")
+VARIANTS = ("vulkan", "rocm", "engram", "fpx", "rdna3")
 SIDECAR_PREFIXES = ("mmproj-", "mtp-", "dflash-", "eagle3-", "dspark-")
 # --ppl corpus: the wikitext-2 raw TEST split, fetched exactly the way llama.cpp's
 # own scripts/get-wikitext-2.sh does, so a PPL printed here is comparable with the
@@ -266,7 +266,7 @@ class Entry:
     @property
     def backend(self) -> str:
         """The `backend` column: which binary runs the model and on which device,
-        e.g. `fpx@vk0`, `rocm@hip0`, `vulkan@vk1`. Declarative (it is what the entry
+        e.g. `rdna3@vk0`, `fpx@vk0`, `rocm@hip0`, `vulkan@vk1`. Declarative (it is what the entry
         asks for), which is exactly what a row has to record: the same model on the
         same box reads 139 t/s on rocm and 8.7 on vulkan (2026-09-15)."""
         return f"{self.variant}@{self.device}" if self.device else self.variant
@@ -1749,7 +1749,7 @@ def bench_kernel(entry: Entry, opts: argparse.Namespace, variant: str, swap: Swa
     if not shutil.which(binary):
         have = sorted(os.path.basename(p) for d in os.environ["PATH"].split(":")
                       for p in glob.glob(os.path.join(d, "llama-bench*")))
-        row.error = f"{binary} not in this image (have: {', '.join(have) or 'none'}; -rocm/-engram only in the :full tag, -fpx needs WITH_FPX)"
+        row.error = f"{binary} not in this image (have: {', '.join(have) or 'none'}; -rocm/-engram only in the :full tag, -fpx needs WITH_FPX, -rdna3 needs WITH_RDNA3)"
         return row
     try:
         gguf = resolve_gguf(entry)
@@ -1795,11 +1795,12 @@ def bench_kernel(entry: Entry, opts: argparse.Namespace, variant: str, swap: Swa
 
 # ── perplexity runner ────────────────────────────────────────────────────────
 def ppl_binary(variant: str | None) -> tuple[str, str]:
-    """Pick the llama-perplexity build. Default order prefers `fpx` because it reads
+    """Pick the llama-perplexity build. Default order prefers `rdna3` then `fpx`
+    because both read
     EVERY quant type in this image (the ROCmFPx types no other build understands),
     and because using ONE binary for every file is what makes a set of PPL rows
     comparable at all -- a PPL from build A and a PPL from build B are not."""
-    order = (variant,) if variant else ("fpx", "vulkan", "rocm", "engram")
+    order = (variant,) if variant else ("rdna3", "fpx", "vulkan", "rocm", "engram")
     for v in order:
         b = "llama-perplexity" + ("" if v == "vulkan" else f"-{v}")
         if shutil.which(b):

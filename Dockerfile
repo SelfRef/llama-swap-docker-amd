@@ -27,6 +27,9 @@
 #     ROCmFPx weight formats (ROCmFP4 & co., GGUF types stock llama.cpp cannot
 #     load), kernels tuned for the batch widths speculative decoding verifies
 #     at, and adaptive draft sizing -- see the WITH_FPX arg below
+#   - OUR OWN fork (SelfRef/llama.cpp-rdna3) as *-rdna3 binaries: the same
+#     ROCmFPx base plus the unupstreamed RDNA3/RDNA3.5 Vulkan patches we have
+#     measured on gfx1100/1101/1151 -- see the WITH_RDNA3 arg below
 #   - Vulkan builds of llama.cpp, whisper.cpp, sd.cpp and audio.cpp with a
 #     MODERN glslc. Upstream builds them on Ubuntu 24.04 with its stock glslc
 #     (shaderc 2023.8 / glslang 14), which cannot compile the
@@ -77,7 +80,8 @@
 # was built, with the PRs merged, is recorded in /versions.txt.
 #
 # Layout: llama.cpp is installed as self-contained directories
-# /opt/llama-vulkan, /opt/llama-rocm, /opt/llama-engram and /opt/llama-fpx
+# /opt/llama-vulkan, /opt/llama-rocm, /opt/llama-engram, /opt/llama-fpx and
+# /opt/llama-rdna3
 # (binaries + their shared libs, RPATH $ORIGIN, ggml backends discovered next
 # to the executable) with symlinks in /usr/local/bin, so the builds never
 # share a libggml.
@@ -443,6 +447,52 @@ ARG FPX_REPO=https://github.com/LaurentZuijdwijk/llama.cpp.git
 ARG FPX_BRANCH=master
 ARG FPX_COMMIT=""
 
+# ── RDNA3 fork (SelfRef/llama.cpp-rdna3) ───────────────────────────────
+# OUR fork of ggml-org/llama.cpp, built as a FOURTH Vulkan llama.cpp install
+# (/opt/llama-rdna3, *-rdna3 binaries). Created 2026-09-18 because the two
+# things this hardware needs have never been in one tree:
+#
+#   - the ROCmFPx weight formats (as in the fpx stage above), which upstream
+#     does not carry and probably will not until 0cc4m's #28898 lands FP8/NVFP4
+#     quant scales in ggml;
+#   - a set of RDNA3/RDNA3.5 Vulkan patches that were written against upstream,
+#     measured, and then NEVER submitted -- they exist only as patch files
+#     passed between community forks (voidsurfer/llama.cpp-nudge <- Nathan
+#     Wilson's strix-halo-vulkan, plus Gaetan Puleo's server fixes).
+#
+# The fpx stage can host neither: it tracks someone else's fork, which cannot
+# take LLAMA_PATCHES (11 conflicts, see above) and whose owner decides what it
+# carries. This one is ours: branch `rdna3` = the ROCmFPx base with the patches
+# we have measured on OUR cards, rebased on our schedule, every patch on its own
+# `carry/*` branch so one bad upstream rebase does not take the rest with it.
+#
+# Targets, and the reason for the name: gfx1100 (RX 7900 XTX), gfx1101
+# (RX 7800 XT) and gfx1151 (Strix Halo / Ryzen AI Max+ 395) -- one architecture
+# family (RDNA3 + RDNA3.5). Nothing else is accepted into the branch.
+#
+# Like the fpx stage this is Vulkan-only and applies NO upstream PRs YET: the
+# branch is still based at the fork point (upstream 0190529e, 2026-08-30) so PR
+# heads do not apply. Moving that base up -- and with it finally getting
+# LLAMA_PATCHES *and* FP4 in ONE binary -- is the point of owning the fork, and
+# it is a re-port, not a rebase: #25773 rewrote matmul pipeline creation and
+# #28732 split the Vulkan sources. Do it in steps, benchmarking each one.
+#
+# ALWAYS build with RDNA3_COMMIT pinned -- scripts/resolve-refs.sh resolves it for
+# you. The clone happens inside a RUN whose cache key is the ARG VALUES, so a
+# build that passes only RDNA3_BRANCH silently reuses the layer from whatever the
+# branch pointed at last time: measured 2026-09-18, a rebuild after a force-push
+# returned the PREVIOUS tip's binary and reported the old commit in
+# /versions.txt. The same trap applies to FPX_BRANCH and ENGRAM_BRANCH.
+# Pass the FULL 40-char sha, never an abbreviation: the clone is a
+# `git fetch --depth=1 origin <ref>`, and GitHub rejects a short sha in a want
+# line -- the stage then fails with a bare `exit code: 128`. The same canaries as the fpx stage guard it: if a rebase ever drops the
+# ROCmFPx types or adaptive drafting, the build FAILS instead of shipping a
+# plain llama.cpp under the -rdna3 name.
+ARG WITH_RDNA3=true
+ARG RDNA3_REPO=https://github.com/SelfRef/llama.cpp-rdna3.git
+ARG RDNA3_BRANCH=rdna3
+ARG RDNA3_COMMIT=""
+
 # ── EngramHalo.cpp ─────────────────────────────────────────────────────
 # EngramHalo.cpp: Aristo94's llama.cpp fork tuned for Qwen 3.8 Flash-Next on
 # Strix Halo (gfx1151) — QSA sparse-gather attention, HIP wide top-k kernel,
@@ -598,6 +648,15 @@ for f in "$OUT"/*; do
     if ldd "$f" 2>/dev/null | grep -q "not found"; then
         echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
 done
+# A backend .so with an UNDEFINED SYMBOL links fine, then fails dlopen at runtime and
+# ggml silently falls back to the CPU -- measured 2026-09-18: a lost definition in the
+# Vulkan backend produced a binary that passed every canary above, answered correctly,
+# and ran Qwen3.8-27B at 2.7 t/s on 16 CPU threads. ldd -r resolves symbols, ldd does not.
+for lib in "$OUT"/libggml-*.so; do
+    if LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep -q "undefined symbol"; then
+        echo "FATAL: $lib has undefined symbols (would fail dlopen -> silent CPU fallback):" >&2
+        LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep "undefined symbol" | head -5 >&2; exit 1; fi
+done
 { echo "llama_vulkan_commit: $(cat .base-commit) (requested: ${LLAMA_COMMIT}; merged tree $(git rev-parse --short HEAD))";
   echo "llama_patches: $(cat .merged-prs)";
   echo "llama_local_patches: $(cat .local-patches)";
@@ -684,6 +743,15 @@ for f in "$OUT"/*; do
     if ldd "$f" 2>/dev/null | grep -q "not found"; then
         echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
 done
+# A backend .so with an UNDEFINED SYMBOL links fine, then fails dlopen at runtime and
+# ggml silently falls back to the CPU -- measured 2026-09-18: a lost definition in the
+# Vulkan backend produced a binary that passed every canary above, answered correctly,
+# and ran Qwen3.8-27B at 2.7 t/s on 16 CPU threads. ldd -r resolves symbols, ldd does not.
+for lib in "$OUT"/libggml-*.so; do
+    if LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep -q "undefined symbol"; then
+        echo "FATAL: $lib has undefined symbols (would fail dlopen -> silent CPU fallback):" >&2
+        LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep "undefined symbol" | head -5 >&2; exit 1; fi
+done
 # The whole point of this stage: the ROCmFPx tensor types and adaptive
 # drafting must be present. If a later upstream merge in the fork drops
 # either, this build fails instead of silently shipping a plain llama.cpp
@@ -701,6 +769,110 @@ grep -q -- '--spec-draft-adaptive' <<<"$SHELP" || {
 { echo "llama_fpx_commit: $(git rev-parse HEAD) (${FPX_REPO} @ ${FPX_BRANCH})";
   echo "llama_fpx_types: $(sed -n 's/^ *[0-9]* *or *\(Q[0-9]_[0-9]_ROCM[A-Z0-9_]*\) .*/\1/p' <<<"$QHELP" | sort -u | tr '\n' ' ')"; } \
   > /install/build-info/llama-fpx
+BUILD
+
+# ── Build the RDNA3 fork (Vulkan) ──────────────────────────────────────
+# Our own fork -> /opt/llama-rdna3, *-rdna3 binaries. Identical toolchain and
+# flags to the fpx stage (same vulkan-builder, same ccache); see the WITH_RDNA3
+# arg above for what the branch carries and why it exists next to the fpx one.
+
+FROM vulkan-builder AS llama-rdna3
+ARG RDNA3_REPO
+ARG RDNA3_BRANCH
+ARG RDNA3_COMMIT
+RUN --mount=type=cache,id=ccache-vulkan,target=/ccache <<'BUILD'
+#!/bin/bash
+set -euo pipefail
+
+REF="${RDNA3_COMMIT:-${RDNA3_BRANCH}}"
+echo "=== Cloning the RDNA3 fork (${RDNA3_BRANCH} @ ${REF}) ==="
+mkdir -p /src/llama-rdna3 && cd /src/llama-rdna3
+git init -q
+git remote add origin "${RDNA3_REPO}"
+git fetch --depth=1 origin "${REF}"
+git checkout -q FETCH_HEAD
+echo "fork at $(git rev-parse HEAD)"
+
+echo "=== glslc feature tests (llama.cpp's own) ==="
+for t in integer_dot bfloat16 coopmat; do
+    f="ggml/src/ggml-vulkan/vulkan-shaders/feature-tests/$t.comp"
+    [ -f "$f" ] || { echo "(no feature test $t in this revision, skipping)"; continue; }
+    if glslc -o /dev/null -fshader-stage=compute --target-env=vulkan1.3 "$f" >/dev/null 2>&1; then
+        echo "  $t: OK"
+    else
+        echo "FATAL: glslc cannot compile $f -- the Vulkan build would lose that code path" >&2
+        exit 1
+    fi
+done
+
+echo "=== Building the RDNA3 fork (Vulkan) ==="
+cmake -B build \
+    -DGGML_NATIVE=OFF \
+    -DGGML_VULKAN=ON \
+    -DBUILD_SHARED_LIBS=ON \
+    -DGGML_BACKEND_DL=ON \
+    -DGGML_CPU_ALL_VARIANTS=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+    -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+    2>&1 | tee /tmp/configure-rdna3.log
+for ext in GL_EXT_integer_dot_product GL_EXT_bfloat16 GL_KHR_cooperative_matrix; do
+    line=$(grep -i "$ext" /tmp/configure-rdna3.log || true)
+    echo "  cmake: ${line:-<no message for $ext>}"
+    if grep -qi "not supported" <<<"$line"; then
+        echo "FATAL: CMake reports $ext unsupported by glslc" >&2; exit 1; fi
+done
+cmake --build build --config Release -j"$(nproc)"
+
+echo "=== Collecting ==="
+OUT=/install/llama-rdna3
+mkdir -p "$OUT" /install/build-info
+for bin in llama-server llama-cli llama-bench llama-quantize llama-perplexity; do
+    [ -f "build/bin/$bin" ] || { echo "FATAL: $bin not built" >&2; exit 1; }
+    cp "build/bin/$bin" "$OUT/${bin}-rdna3"
+done
+cp -P build/bin/*.so* "$OUT/"
+ls "$OUT"/libggml-cpu-*.so >/dev/null 2>&1 || { echo "FATAL: no ggml-cpu variants built" >&2; exit 1; }
+ls "$OUT"/libggml-vulkan.so >/dev/null 2>&1 || { echo "FATAL: libggml-vulkan.so not built" >&2; exit 1; }
+# Same relocatable check as the llama-vulkan stage.
+for f in "$OUT"/*; do
+    [ -L "$f" ] && continue
+    rp=$(readelf -d "$f" 2>/dev/null | awk '/RUNPATH|RPATH/ {gsub(/[\[\]]/,"",$NF); print $NF}')
+    if [ -n "$rp" ] && { [[ "$rp" != '$ORIGIN'* ]] || [[ "$rp" == */src/* ]]; }; then
+        echo "FATAL: $f has run path '$rp' (expected \$ORIGIN[:...])" >&2; exit 1; fi
+    if ldd "$f" 2>/dev/null | grep -q "not found"; then
+        echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
+done
+# A backend .so with an UNDEFINED SYMBOL links fine, then fails dlopen at runtime and
+# ggml silently falls back to the CPU -- measured 2026-09-18: a lost definition in the
+# Vulkan backend produced a binary that passed every canary above, answered correctly,
+# and ran Qwen3.8-27B at 2.7 t/s on 16 CPU threads. ldd -r resolves symbols, ldd does not.
+for lib in "$OUT"/libggml-*.so; do
+    if LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep -q "undefined symbol"; then
+        echo "FATAL: $lib has undefined symbols (would fail dlopen -> silent CPU fallback):" >&2
+        LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep "undefined symbol" | head -5 >&2; exit 1; fi
+done
+# The whole point of this stage: the ROCmFPx tensor types and adaptive
+# drafting must be present. If a later upstream merge in the fork drops
+# either, this build fails instead of silently shipping a plain llama.cpp
+# under the -rdna3 name (config entries that reference these files would then
+# fail to load a model at runtime).
+# (both binaries print their help to stdout and EXIT 1, so capture first --
+# a `cmd | grep` would fail the build through `pipefail`, not through grep.)
+QHELP=$("$OUT/llama-quantize-rdna3" --help 2>&1 || true)
+grep -q 'Q4_0_ROCMFP4_FAST' <<<"$QHELP" || {
+    echo "FATAL: llama-quantize-rdna3 does not know the ROCmFPx types -- the fork lost them" >&2
+    head -5 <<<"$QHELP" >&2; exit 1; }
+SHELP=$("$OUT/llama-server-rdna3" --help 2>&1 || true)
+grep -q -- '--spec-draft-adaptive' <<<"$SHELP" || {
+    echo "FATAL: llama-server-rdna3 has no --spec-draft-adaptive -- the fork lost adaptive drafting" >&2; exit 1; }
+{ echo "llama_rdna3_commit: $(git rev-parse HEAD) (${RDNA3_REPO} @ ${RDNA3_BRANCH})";
+  echo "llama_rdna3_types: $(sed -n 's/^ *[0-9]* *or *\(Q[0-9]_[0-9]_ROCM[A-Z0-9_]*\) .*/\1/p' <<<"$QHELP" | sort -u | tr '\n' ' ')"; } \
+  > /install/build-info/llama-rdna3
 BUILD
 
 # ── Build whisper.cpp (Vulkan) ─────────────────────────────────────────
@@ -1083,6 +1255,15 @@ for f in "$OUT"/*; do
     if ldd "$f" 2>/dev/null | grep -q "not found"; then
         echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
 done
+# A backend .so with an UNDEFINED SYMBOL links fine, then fails dlopen at runtime and
+# ggml silently falls back to the CPU -- measured 2026-09-18: a lost definition in the
+# Vulkan backend produced a binary that passed every canary above, answered correctly,
+# and ran Qwen3.8-27B at 2.7 t/s on 16 CPU threads. ldd -r resolves symbols, ldd does not.
+for lib in "$OUT"/libggml-*.so; do
+    if LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep -q "undefined symbol"; then
+        echo "FATAL: $lib has undefined symbols (would fail dlopen -> silent CPU fallback):" >&2
+        LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep "undefined symbol" | head -5 >&2; exit 1; fi
+done
 { echo "llama_rocm_commit: $(cat .base-commit) (requested: ${LLAMA_COMMIT}; merged tree $(git rev-parse --short HEAD))";
   echo "llama_rocm_patches: $(cat .merged-prs)";
   echo "llama_rocm_local_patches: $(cat .local-patches)";
@@ -1166,6 +1347,15 @@ for f in "$OUT"/*; do
         echo "FATAL: $f has run path '$rp' (expected \$ORIGIN[:...])" >&2; exit 1; fi
     if ldd "$f" 2>/dev/null | grep -q "not found"; then
         echo "FATAL: $f has unresolved libraries" >&2; ldd "$f" | grep "not found" >&2; exit 1; fi
+done
+# A backend .so with an UNDEFINED SYMBOL links fine, then fails dlopen at runtime and
+# ggml silently falls back to the CPU -- measured 2026-09-18: a lost definition in the
+# Vulkan backend produced a binary that passed every canary above, answered correctly,
+# and ran Qwen3.8-27B at 2.7 t/s on 16 CPU threads. ldd -r resolves symbols, ldd does not.
+for lib in "$OUT"/libggml-*.so; do
+    if LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep -q "undefined symbol"; then
+        echo "FATAL: $lib has undefined symbols (would fail dlopen -> silent CPU fallback):" >&2
+        LD_LIBRARY_PATH="$OUT" ldd -r "$lib" 2>&1 | grep "undefined symbol" | head -5 >&2; exit 1; fi
 done
 { echo "llama_engram_commit: $(git rev-parse HEAD) (${ENGRAM_REPO} @ ${ENGRAM_BRANCH})";
   echo "llama_engram_targets: ${ENGRAM_TARGETS}"; } > /install/build-info/llama-engram
@@ -1309,6 +1499,17 @@ FROM llama-fpx AS llama-fpx-true
 FROM fpx-none  AS llama-fpx-false
 FROM llama-fpx-${WITH_FPX} AS llama-fpx-sel
 
+# ── RDNA3 fork selection (WITH_RDNA3) ──────────────────────────────────
+# Same shape as the fpx switch above: Vulkan-only, in BOTH published tags,
+# independent of WITH_ROCM.
+
+FROM alpine:3 AS rdna3-none
+RUN mkdir -p /install/llama-rdna3 /install/build-info
+
+FROM llama-rdna3 AS llama-rdna3-true
+FROM rdna3-none  AS llama-rdna3-false
+FROM llama-rdna3-${WITH_RDNA3} AS llama-rdna3-sel
+
 # ══════════════════════════════════════════════════════════════════════
 # ── Final image: Ubuntu 24.04 runtime (+ ROCm) + everything built above ──
 
@@ -1323,6 +1524,7 @@ ARG QWEN_SHARP_TEMPLATE_URL
 ARG WITH_ROCM
 ARG WITH_ENGRAM
 ARG WITH_FPX
+ARG WITH_RDNA3
 
 LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-docker-amd" \
       org.opencontainers.image.description="llama-swap unified image for AMD GPUs (ROCm + Vulkan)"
@@ -1418,6 +1620,7 @@ COPY --from=whisper-rocm-sel /install/bin/ /usr/local/bin/
 COPY --from=sd-rocm-sel      /install/bin/ /usr/local/bin/
 COPY --from=llama-engram-sel /install/llama-engram/ /opt/llama-engram/
 COPY --from=llama-fpx-sel    /install/llama-fpx/ /opt/llama-fpx/
+COPY --from=llama-rdna3-sel  /install/llama-rdna3/ /opt/llama-rdna3/
 # build-info of every stage -> /versions.txt below
 COPY --from=llama-vulkan     /install/build-info/ /tmp/build-info/
 COPY --from=whisper-vulkan   /install/build-info/ /tmp/build-info/
@@ -1429,6 +1632,7 @@ COPY --from=whisper-rocm-sel /install/build-info/ /tmp/build-info/
 COPY --from=sd-rocm-sel      /install/build-info/ /tmp/build-info/
 COPY --from=llama-engram-sel /install/build-info/ /tmp/build-info/
 COPY --from=llama-fpx-sel    /install/build-info/ /tmp/build-info/
+COPY --from=llama-rdna3-sel  /install/build-info/ /tmp/build-info/
 RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
         ln -sf "/opt/llama-vulkan/$bin" "/usr/local/bin/$bin"; \
         if [ "${WITH_ROCM}" = "true" ]; then \
@@ -1446,6 +1650,11 @@ RUN for bin in llama-server llama-cli llama-tts llama-bench; do \
             ln -sf "/opt/llama-fpx/$bin-fpx" "/usr/local/bin/$bin-fpx"; \
         done; \
     else rmdir /opt/llama-fpx; fi \
+    && if [ "${WITH_RDNA3}" = "true" ]; then \
+        for bin in llama-server llama-cli llama-bench llama-quantize llama-perplexity; do \
+            ln -sf "/opt/llama-rdna3/$bin-rdna3" "/usr/local/bin/$bin-rdna3"; \
+        done; \
+    else rmdir /opt/llama-rdna3; fi \
     && ldconfig
 
 # Example config with both backends; override by mounting /etc/llama-swap/config
@@ -1496,6 +1705,10 @@ if [ "${WITH_FPX}" = "true" ]; then
     BINS="$BINS llama-server-fpx llama-cli-fpx llama-bench-fpx llama-quantize-fpx llama-perplexity-fpx"
     SERVERS="$SERVERS llama-server-fpx"
 fi
+if [ "${WITH_RDNA3}" = "true" ]; then
+    BINS="$BINS llama-server-rdna3 llama-cli-rdna3 llama-bench-rdna3 llama-quantize-rdna3 llama-perplexity-rdna3"
+    SERVERS="$SERVERS llama-server-rdna3"
+fi
 for bin in $BINS; do
     out=$(ldd "$(readlink -f "$(command -v "$bin")")")
     if grep -q 'not found' <<<"$out"; then
@@ -1504,7 +1717,7 @@ for bin in $BINS; do
         exit 1
     fi
 done
-for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*) $([ -d /opt/llama-engram ] && echo /opt/llama-engram/*.so*) $([ -d /opt/llama-fpx ] && echo /opt/llama-fpx/*.so*); do
+for lib in /opt/llama-vulkan/*.so* $([ "${WITH_ROCM}" = "true" ] && echo /opt/llama-rocm/*.so*) $([ -d /opt/llama-engram ] && echo /opt/llama-engram/*.so*) $([ -d /opt/llama-fpx ] && echo /opt/llama-fpx/*.so*) $([ -d /opt/llama-rdna3 ] && echo /opt/llama-rdna3/*.so*); do
     if ldd "$lib" | grep -q 'not found'; then
         echo "FATAL: $lib has unresolved libraries" >&2; ldd "$lib" | grep 'not found' >&2; exit 1; fi
 done
@@ -1555,7 +1768,7 @@ first() { awk -v k="$1" '$1==k {print $2; exit}' "/tmp/build-info/$2"; }
   fi
   echo "mesa_vulkan_drivers: $(dpkg-query -W -f '${Version}' mesa-vulkan-drivers) (${MESA_PPA:-ubuntu})"
   echo "cpu_variants: $(ls /opt/llama-vulkan/libggml-cpu-*.so | sed 's|.*/libggml-cpu-||; s|\.so||' | tr '\n' ' ')"
-  for f in llama-swap llama-vulkan llama-rocm llama-engram llama-fpx whisper-vulkan whisper-rocm sd-vulkan sd-rocm audiocpp; do
+  for f in llama-swap llama-vulkan llama-rocm llama-engram llama-fpx llama-rdna3 whisper-vulkan whisper-rocm sd-vulkan sd-rocm audiocpp; do
     [ -f "/tmp/build-info/$f" ] && cat "/tmp/build-info/$f"
   done
   echo "qwen_chat_template: $(grep -o 'template_version = "[^"]*"' /etc/llama-swap/templates/qwen-fixed.jinja | head -1 | cut -d'"' -f2) (${QWEN_TEMPLATE_URL})"
