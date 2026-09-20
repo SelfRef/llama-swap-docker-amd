@@ -176,7 +176,7 @@ N_WARMUP = 16
 # --kv-unified the position in the shared cache) would otherwise vary between
 # identical requests and change the greedy path -> spurious DRIFT.
 GREEDY = {"temperature": 0, "top_k": 1, "seed": 42, "id_slot": 0}
-# The community-comparable llama-bench line (LLM_BENCHMARK.md, "kernel-level").
+# The community-comparable llama-bench line ("kernel-level" in the reports this tool feeds).
 STANDARD_BENCH = ["-fa", "1", "-ctk", "q8_0", "-ctv", "q4_0", "-b", "2048", "-ub", "512",
                   "-p", "512", "-n", "128", "-d", "0,8192"]
 FIT_MARGIN_MIB = 1024  # llama-server's --fit on default margin (1 GiB)
@@ -1327,7 +1327,7 @@ PRESETS: dict[str, Preset] = {p.name: p for p in [
 TEXT_PRESETS = [n for n, p in PRESETS.items() if not p.cases]
 VISION_PRESETS = [n for n, p in PRESETS.items() if p.cases]
 # group name -> preset names. `text` is the default sweep (it is what every historic
-# LLM_BENCHMARK.md row was produced with, and most entries take no image); `all` =
+# result row was produced with, and most entries take no image); `all` =
 # text + vision. Before 2026-09-08 the groups were called `all` (text) and `full` (both).
 # `fast` is the smoke-test subset: short prompts, <=512 generated tokens, no 32k
 # prefill/depth, no 1k-token copy task -- ~1 minute per GPU entry instead of ~5.

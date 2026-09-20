@@ -432,8 +432,7 @@ ARG LLAMA_PATCHES_HEADS=""
 #     operand for quantized matmul/matmul_id, a tiled concat-transpose for the
 #     delta-net conv state.
 #
-# Measured here on an RX 7900 XTX (gfx1100, RADV/Mesa 26.2.2, 2026-09-09,
-# full tables in the cloud repo's LLM_BENCHMARK.md) -- Qwen3.8-27B with its
+# Measured on an RX 7900 XTX (gfx1100, RADV/Mesa 26.2.2, 2026-09-09) -- Qwen3.8-27B with its
 # baked MTP head, greedy prose / json / refactor decode t/s:
 #   stock llama-server, unsloth UD-Q4_K_XL (16.35 GiB), n-max 3
 #       60.9 / 83.6 / 94.7   prefill 423 / 328 / 777   VRAM 22.3 G  PPL 6.637
