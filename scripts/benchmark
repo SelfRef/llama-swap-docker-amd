@@ -942,11 +942,20 @@ class VisionCase:
     def body(self, model: str) -> dict:
         return {"model": model, "stream": False, "n_predict": self.n_predict,
                 "ignore_eos": False, "cache_prompt": False, "id_slot": 0,
+                # See NO_THINKING below: an accuracy probe with a 64-token
+                # budget must not spend it on a reasoning trace.
+                "chat_template_kwargs": dict(NO_THINKING),
                 "messages": [
                     {"role": "system", "content": self.system},
                     {"role": "user", "content": [
                         {"type": "image_url", "image_url": {"url": image_data_url(self.image)}},
                         {"type": "text", "text": self.question}]}]}
+
+
+# Sent by every preset except `reasoning`. A server merges a request's
+# chat_template_kwargs over its own defaults, so this pins the measured path
+# whatever the model id's default effort is.
+NO_THINKING = {"enable_thinking": False}
 
 
 _OCR_SYSTEM = ("You are an OCR engine. Transcribe the image exactly as printed, "
@@ -1289,6 +1298,13 @@ class Preset:
                 prompt = PROSE_PROMPT if self.name == "prose" else JSON_PROMPT
             return {"prompt": prompt, **common}
         body = {"model": model, "stream": False, **common}
+        if self.name != "reasoning":
+            # Speed presets measure the NON-thinking path, and say so rather
+            # than inheriting it: a catalogue is free to serve a bare model id
+            # that thinks by default (llama.cpp's --reasoning / the template's
+            # own default), and a preset that silently flipped into thinking
+            # would not be comparable with the numbers next to it.
+            body["chat_template_kwargs"] = dict(NO_THINKING)
         if self.name == "refactor":
             body["messages"] = REFACTOR_MESSAGES
         elif self.name == "agent":
