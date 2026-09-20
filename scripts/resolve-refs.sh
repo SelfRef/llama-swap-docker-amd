@@ -16,7 +16,7 @@
 #   scripts/resolve-refs.sh            KEY=VALUE per line (CI: >> $GITHUB_OUTPUT)
 #   scripts/resolve-refs.sh --docker   --build-arg=KEY=VALUE per line, for a local
 #                                      build that picks up today's commits:
-#                                        docker buildx build $(scripts/resolve-refs.sh --docker) -t llama-swap-amd .
+#                                        docker buildx build $(scripts/resolve-refs.sh --docker) -t llama-swap-rdna .
 #
 # Every input defaults to the Dockerfile's ARG default and can be overridden
 # from the environment: LLAMA_COMMIT LLAMA_PATCHES WHISPER_COMMIT SD_COMMIT

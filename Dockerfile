@@ -88,12 +88,12 @@
 # whisper/sd/audio.cpp binaries are static.
 #
 # Build:
-#   docker buildx build -t llama-swap-amd .
+#   docker buildx build -t llama-swap-rdna .
 #
 # Run (container is root, so no --group-add is needed for device access):
 #   docker run -it --rm --device /dev/kfd --device /dev/dri \
 #     --security-opt seccomp=unconfined \
-#     -p 8080:8080 -v $PWD/models:/models llama-swap-amd
+#     -p 8080:8080 -v $PWD/models:/models llama-swap-rdna
 #
 # See README.md for build args, GPU support and runtime env vars.
 
@@ -1577,7 +1577,7 @@ ARG WITH_ENGRAM
 ARG WITH_FPX
 ARG WITH_RDNA3
 
-LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-docker-amd" \
+LABEL org.opencontainers.image.source="https://github.com/SelfRef/llama-swap-rdna" \
       org.opencontainers.image.description="llama-swap unified image for AMD GPUs (ROCm + Vulkan)"
 
 ENV DEBIAN_FRONTEND=noninteractive

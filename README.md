@@ -52,9 +52,9 @@ Until 2026-09-06 this image was `FROM ghcr.io/mostlygeek/llama-swap:unified-vulk
 Prebuilt by [GitHub Actions](.github/workflows/build.yml). Two tags from the same Dockerfile (`WITH_ROCM`):
 
 ```bash
-docker pull ghcr.io/selfref/llama-swap-docker-amd:vulkan   # Vulkan only (~1.5 GB)
-docker pull ghcr.io/selfref/llama-swap-docker-amd:full     # Vulkan + ROCm
-docker pull ghcr.io/selfref/llama-swap-docker-amd:latest   # alias for :full
+docker pull ghcr.io/selfref/llama-swap-rdna:vulkan   # Vulkan only (~1.5 GB)
+docker pull ghcr.io/selfref/llama-swap-rdna:full     # Vulkan + ROCm
+docker pull ghcr.io/selfref/llama-swap-rdna:latest   # alias for :full
 ```
 
 Both tags are rebuilt on every push and every 3 days by the scheduled run, each time from the then-current default branches of llama-swap, llama.cpp, whisper.cpp, stable-diffusion.cpp, audio.cpp and EngramHalo.cpp and the current heads of the merged PRs. The ROCm stages are fat multi-gfx HIP builds that take hours of runner time, so on a PR or an ad-hoc run they only happen if you ask for them (Actions → Build image → Run workflow → tick **rocm**). The `*-rocm` binaries, the `*-engram` binaries (see [EngramHalo.cpp for Strix Halo](#engramhalocpp-for-strix-halo)), the ROCm runtime and `rocminfo` exist only in `:full`/`:latest`.
@@ -62,9 +62,9 @@ Both tags are rebuilt on every push and every 3 days by the scheduled run, each 
 Or build locally (expect a couple of hours for the fat HIP builds; `WITH_ROCM=false` for the Vulkan-only image in well under an hour):
 
 ```bash
-docker buildx build -t llama-swap-amd .
+docker buildx build -t llama-swap-rdna .
 # pin every branch/PR to today's commit first (what CI does) -- see "How versions are pinned"
-docker buildx build $(scripts/resolve-refs.sh --docker) -t llama-swap-amd .
+docker buildx build $(scripts/resolve-refs.sh --docker) -t llama-swap-rdna .
 ```
 
 Build args:
@@ -189,12 +189,12 @@ docker run -it --rm \
   -p 8080:8080 \
   -v "$PWD/models:/models" \
   -v "$PWD/config:/etc/llama-swap/config" \
-  ghcr.io/selfref/llama-swap-docker-amd:latest
+  ghcr.io/selfref/llama-swap-rdna:latest
 ```
 
 Or `docker compose up` — see [compose.yml](compose.yml). The llama-swap UI is at http://localhost:8080. The host only needs the `amdgpu` kernel driver (ROCm userspace lives in the image); Vulkan-only use works without `/dev/kfd`.
 
-Edit [config/config.yaml](config/config.yaml) to define your models — it shows the pattern: the same engine as `*-rocm` (ROCm) or plain (Vulkan), chosen per model. The container watches the config and reloads on change. To use a config elsewhere, pass the flags as the container command (they replace the defaults, see [Runtime layout](#runtime-layout)): `... ghcr.io/selfref/llama-swap-docker-amd:latest -config /models/my.yaml -listen 0.0.0.0:8080 -watch-config`.
+Edit [config/config.yaml](config/config.yaml) to define your models — it shows the pattern: the same engine as `*-rocm` (ROCm) or plain (Vulkan), chosen per model. The container watches the config and reloads on change. To use a config elsewhere, pass the flags as the container command (they replace the defaults, see [Runtime layout](#runtime-layout)): `... ghcr.io/selfref/llama-swap-rdna:latest -config /models/my.yaml -listen 0.0.0.0:8080 -watch-config`.
 
 ## Choosing ROCm vs Vulkan
 
@@ -220,23 +220,23 @@ GPU selection on multi-GPU hosts: `HIP_VISIBLE_DEVICES=0` for `*-rocm` binaries,
 ```bash
 # ROCm sees the GPU (needs /dev/kfd + /dev/dri)
 docker run --rm --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined \
-  --entrypoint rocminfo ghcr.io/selfref/llama-swap-docker-amd:latest
+  --entrypoint rocminfo ghcr.io/selfref/llama-swap-rdna:latest
 
 # Each backend's device list
 docker run --rm --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined \
-  --entrypoint llama-server-rocm ghcr.io/selfref/llama-swap-docker-amd:latest --list-devices
+  --entrypoint llama-server-rocm ghcr.io/selfref/llama-swap-rdna:latest --list-devices
 docker run --rm --device /dev/dri \
-  --entrypoint llama-server ghcr.io/selfref/llama-swap-docker-amd:latest --list-devices
+  --entrypoint llama-server ghcr.io/selfref/llama-swap-rdna:latest --list-devices
 
 # Vulkan feature line -- must say "int dot: 1" (see "Why build the Vulkan binaries ourselves")
 docker run --rm --device /dev/dri --entrypoint llama-bench \
-  ghcr.io/selfref/llama-swap-docker-amd:latest -m /dev/null 2>&1 | grep "ggml_vulkan: 0"
+  ghcr.io/selfref/llama-swap-rdna:latest -m /dev/null 2>&1 | grep "ggml_vulkan: 0"
 
 # Versions baked into the image (every commit, merged PR and build option)
-docker run --rm --entrypoint cat ghcr.io/selfref/llama-swap-docker-amd:latest /versions.txt
+docker run --rm --entrypoint cat ghcr.io/selfref/llama-swap-rdna:latest /versions.txt
 
 # llama-swap version (e.g. v255-2-g1a2b3c, plus a +prN suffix per merged PR)
-docker run --rm ghcr.io/selfref/llama-swap-docker-amd:latest -version
+docker run --rm ghcr.io/selfref/llama-swap-rdna:latest -version
 ```
 
 ## Benchmarking

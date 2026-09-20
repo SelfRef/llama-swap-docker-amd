@@ -2,7 +2,7 @@ services:
   llama-swap:
     build: .
     # `docker compose pull` fetches the CI-built image; `docker compose build` rebuilds locally
-    image: ghcr.io/selfref/llama-swap-docker-amd:latest
+    image: ghcr.io/selfref/llama-swap-rdna:latest
     ports:
       - "8080:8080"
     devices:

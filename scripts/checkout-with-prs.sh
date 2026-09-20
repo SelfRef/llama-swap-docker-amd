@@ -57,7 +57,7 @@ for pr in "$@"; do
         echo "PR #${pr} is already contained in ${REF} -- skipping"
         continue
     fi
-    git -c user.name=llama-swap-amd -c user.email=build@localhost \
+    git -c user.name=llama-swap-rdna -c user.email=build@localhost \
         merge --no-edit --no-ff -m "merge upstream PR #${pr}" FETCH_HEAD \
         || { echo "FATAL: PR #${pr} does not merge cleanly into ${REF} -- it has drifted, re-check it" >&2; exit 1; }
     MERGED="${MERGED} ${pr}"

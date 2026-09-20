@@ -74,6 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.image.outputs.name }}
+      title: ${{ steps.image.outputs.title }}
       build_args: ${{ steps.refs.outputs.build_args }}
     steps:
       - uses: actions/checkout@v7
@@ -84,7 +85,10 @@ jobs:
       # GHCR requires lowercase names; github.repository may contain uppercase
       - name: Set image name
         id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          title="${GITHUB_REPOSITORY##*/}"
+          echo "title=${title,,}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve upstream refs to commits
         id: refs
@@ -241,7 +245,7 @@ jobs:
             type=sha,format=short,prefix=vulkan-
             type=schedule,pattern=vulkan-{{date 'YYYYMMDD'}}
           labels: |
-            org.opencontainers.image.title=llama-swap-amd
+            org.opencontainers.image.title=${{ needs.prepare.outputs.title }}
             org.opencontainers.image.description=llama-swap unified image for AMD GPUs (Vulkan; see :full for Vulkan+ROCm)
       # Same 429 retry as in build-stages-vulkan.
       - name: Build and push (Vulkan only)
@@ -336,7 +340,7 @@ jobs:
             type=sha,format=short,prefix=full-
             type=schedule,pattern=full-{{date 'YYYYMMDD'}}
           labels: |
-            org.opencontainers.image.title=llama-swap-amd
+            org.opencontainers.image.title=${{ needs.prepare.outputs.title }}
             org.opencontainers.image.description=llama-swap unified image for AMD GPUs (Vulkan + ROCm)
       # Same 429 retry as in build-stages-vulkan.
       - name: Build and push (Vulkan + ROCm)
