@@ -31,7 +31,11 @@ on:
         description: "Also build the ROCm stages and publish the full image as :full/:latest, as branch pushes do (hours of runner time)"
         type: boolean
         required: false
-        default: false
+        # Checked by default: a manual run is nearly always a re-run of what a
+        # push would have produced, and a Vulkan-only image silently leaves
+        # :full/:latest pointing at the previous build. Uncheck it to get the
+        # quick Vulkan-only image.
+        default: true
       llama_commit:
         description: "llama.cpp revision (sha/tag/branch/refs/pull/N/head); empty = Dockerfile default (master)"
         required: false
@@ -57,8 +61,9 @@ concurrency:
 #   :vulkan          Vulkan only  -- every push, the 3-day scheduled rebuild,
 #                    and every manual run.
 #   :full / :latest  Vulkan+ROCm  -- every push, the 3-day scheduled rebuild,
-#                    or a manual run with the "rocm" checkbox; the HIP stages
-#                    are fat multi-gfx builds that take hours on a runner.
+#                    and every manual run that leaves the "rocm" checkbox
+#                    ticked (it defaults to ticked); the HIP stages are fat
+#                    multi-gfx builds that take hours on a runner.
 #                    :latest is the full image.
 #
 # Nothing is inherited from another image any more, so nothing in the build
